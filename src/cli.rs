@@ -8,6 +8,9 @@ use serde::Serialize;
 
 use crate::artifacts::{self, ArtifactManifest};
 use crate::ast::OntologyChangeProposal;
+use crate::check;
+use crate::check_report::CheckReport;
+use crate::db;
 use crate::llm::{self, AuthorMode};
 use crate::reuse::{self, ReuseReport};
 use crate::seed;
@@ -27,6 +30,34 @@ pub struct Cli {
 pub enum Command {
     /// Author + classify + post + emit-artifacts for a single proposal.
     Propose(ProposeArgs),
+    /// Run the multi-axis risk gate on an existing proposal JSON.
+    Check(CheckArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CheckArgs {
+    /// Path to the proposal JSON (typically `generated/<id>/proposal.json`).
+    pub proposal: PathBuf,
+
+    /// Postgres connection string for the data-conformance axis.
+    /// Falls back to `DATABASE_URL` env var; if both are absent the
+    /// data-conformance axis is skipped (informational).
+    #[arg(long, env = "DATABASE_URL")]
+    pub db: Option<String>,
+
+    /// Optional path to write the CheckReport JSON. Defaults to
+    /// `<proposal-dir>/check_report.json`.
+    #[arg(long)]
+    pub report_out: Option<PathBuf>,
+
+    /// Skip running migrations on startup (useful if the DB is already set up).
+    #[arg(long)]
+    pub skip_migrate: bool,
+
+    /// Print the full CheckReport JSON to stdout (default). Tracing always
+    /// goes to stderr.
+    #[arg(long, default_value_t = true)]
+    pub json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -74,7 +105,96 @@ pub struct ProposeOutcome {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Propose(args) => run_propose(args).await,
+        Command::Check(args) => run_check(args).await,
     }
+}
+
+async fn run_check(args: CheckArgs) -> Result<()> {
+    eprintln!("[agora] check: loading proposal from {}", args.proposal.display());
+    let raw = std::fs::read_to_string(&args.proposal)
+        .with_context(|| format!("reading proposal from {}", args.proposal.display()))?;
+    let proposal: OntologyChangeProposal =
+        serde_json::from_str(&raw).context("parsing proposal JSON")?;
+
+    // Connect to Postgres (graceful: returns None if unset/unreachable).
+    let pool = db::connect_optional(args.db.as_deref()).await?;
+    if let Some(p) = &pool {
+        if !args.skip_migrate {
+            eprintln!("[agora] check: applying M0 migrations (idempotent)");
+            db::migrate(p).await.context("running migrations")?;
+        } else {
+            eprintln!("[agora] check: --skip-migrate set; assuming schema is in place");
+        }
+    } else {
+        eprintln!("[agora] check: no DB connection — data-conformance axis will skip");
+    }
+
+    let catalog = seed::baseline_concepts();
+
+    let report = check::check(&proposal, &catalog, pool.as_ref())
+        .await
+        .context("running multi-axis risk gate")?;
+
+    // Stderr summary for humans.
+    eprintln!(
+        "[agora] check: proposal {} → {} (auto_approval_eligible={})",
+        report.proposal_id, report.status, report.auto_approval_eligible
+    );
+    for row in &report.checks {
+        eprintln!(
+            "[agora]   axis={:12} outcome={:8?} confidence={:?} src={} ({} ms) — {}",
+            row.axis.as_str(),
+            row.outcome,
+            row.confidence,
+            row.source,
+            row.elapsed_ms,
+            row.findings
+        );
+    }
+    eprintln!(
+        "[agora]   axis=data_conformance outcome={:?} violations={} ({} ms) src={}",
+        report.data_conformance.outcome,
+        report.data_conformance.violations_found,
+        report.data_conformance.query_time_ms,
+        report.data_conformance.source,
+    );
+    if let Some(br) = &report.block_reason {
+        eprintln!("[agora]   block_reason: {}", br);
+    }
+    eprintln!("[agora]   total elapsed: {} ms", report.elapsed_ms);
+
+    // Always write the report next to the proposal for downstream pods.
+    let report_path = args.report_out.clone().unwrap_or_else(|| {
+        args.proposal
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("check_report.json")
+    });
+    if let Some(parent) = report_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating dir {}", parent.display()))?;
+        }
+    }
+    std::fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).context("serializing CheckReport")?,
+    )
+    .with_context(|| format!("writing CheckReport to {}", report_path.display()))?;
+    eprintln!("[agora]   report   → {}", report_path.display());
+
+    if args.json {
+        let s = serde_json::to_string_pretty(&report).context("CheckReport to JSON")?;
+        println!("{}", s);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckOutcome {
+    pub report: CheckReport,
 }
 
 async fn run_propose(args: ProposeArgs) -> Result<()> {

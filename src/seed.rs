@@ -135,6 +135,53 @@ pub fn baseline_concepts() -> Vec<ConceptCard> {
             },
         },
         ConceptCard {
+            fqn: "core.users.Account".into(),
+            summary: "account customer profile email login authentication \
+                    identity holder ledger record nullable optional"
+                .into(),
+            spec: OntologyType {
+                namespace: "core.users".into(),
+                name: "Account".into(),
+                version: 2,
+                fields: vec![
+                    Field {
+                        name: "id".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 1,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some("Stable id".into()),
+                    },
+                    // email is intentionally OPTIONAL in the baseline — this is
+                    // what makes Beat 6's risky proposal (optional→required)
+                    // a real semantic refinement, and what makes the 47 NULL
+                    // rows a real data-conformance violation.
+                    Field {
+                        name: "email".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 2,
+                        required: false,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Pii,
+                        doc: Some("Contact email. Currently optional; many \
+                                   legacy rows have NULL.".into()),
+                    },
+                ],
+                relations: vec![],
+                invariants: vec![],
+                ownership: Ownership {
+                    team: "identity-platform".into(),
+                    semantic_steward: Some("core-ontology".into()),
+                },
+                policy_class: PolicyClass::Pii,
+                locality: Some("region".into()),
+                doc: Some("Canonical customer account record.".into()),
+            },
+        },
+        ConceptCard {
             fqn: "core.users.User".into(),
             summary: "user account person profile identity email name customer".into(),
             spec: OntologyType {

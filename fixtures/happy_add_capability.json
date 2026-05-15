@@ -1,0 +1,54 @@
+{
+  "id": "prop_happy_capability",
+  "domain": "integrations",
+  "namespace": "core.integrations",
+  "change_intent": "Add optional 'supports_oauth' capability flag to AuthenticationMethod.",
+  "rationale": "Surface per-provider capability so the runtime can route to the right auth flow without provider-name string matching.",
+  "change": {
+    "kind": "add_field",
+    "type_ref": { "namespace": "core.integrations", "name": "AuthenticationMethod" },
+    "field": {
+      "name": "supports_oauth",
+      "proto_type": "Bool",
+      "proto_number": 17,
+      "required": false,
+      "since_version": 2,
+      "classification": "Internal",
+      "doc": "Whether this auth method supports OAuth 2.0."
+    }
+  },
+  "semantic_contract": {
+    "meaning_before": "AuthenticationMethod did not record OAuth capability.",
+    "meaning_after": "AuthenticationMethod records OAuth capability as an optional flag.",
+    "justification": "Field is additive and optional; existing rows interpreted as 'unknown'.",
+    "invariants": [
+      "supports_oauth=true implies the provider must accept OAuth tokens.",
+      "Setting supports_oauth does not change the visibility class of AuthenticationMethod."
+    ]
+  },
+  "compatibility": {
+    "shape": "additive",
+    "semantic": "additive",
+    "temporal": "additive",
+    "policy": "additive",
+    "api": "additive",
+    "storage": "additive"
+  },
+  "ownership": {
+    "team": "integrations-platform",
+    "semantic_steward": "core-ontology"
+  },
+  "tests": [
+    {
+      "name": "default_false_post_migration",
+      "kind": "smoke",
+      "assertion": "After migration, all existing rows have supports_oauth = false."
+    }
+  ],
+  "provenance": {
+    "author": "agent://schema-broker-1",
+    "source_prompt": "we need to know which auth methods support oauth",
+    "model": "claude-sonnet-4-5",
+    "generated_at": "2026-05-15T01:32:00Z"
+  }
+}
