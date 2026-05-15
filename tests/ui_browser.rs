@@ -284,7 +284,8 @@ async fn ui_write_then_tamper_then_verify_reports_drift() {
         .expect("tamper body");
     assert!(tamper_html.contains("Out-of-band UPDATE issued"));
 
-    // 4. Verify again — drift detected for our row.
+    // 4. Verify again — drift detected for our row, with field-level diff
+    //    showing the actual logged-vs-current value (Gate 4 falsification).
     let verify2_html = c
         .get(format!("{base}/ui/verify"))
         .send()
@@ -298,6 +299,20 @@ async fn ui_write_then_tamper_then_verify_reports_drift() {
         verify2_html.contains(entity_id.as_str()),
         "expected tampered entity {entity_id} to appear in verify report"
     );
+    // The logged value (what we wrote: "plaid") and the tampered current
+    // value ("evil_corp_tampered") must BOTH be visible — this is the
+    // expected-vs-actual proof reviewers will look for.
+    assert!(
+        verify2_html.contains("plaid"),
+        "expected logged value 'plaid' in field-diff; body excerpt:\n{}",
+        &verify2_html[..verify2_html.len().min(2000)]
+    );
+    assert!(
+        verify2_html.contains("evil_corp_tampered"),
+        "expected current value 'evil_corp_tampered' in field-diff"
+    );
+    // The provider field name must appear in the diff table.
+    assert!(verify2_html.contains("provider"));
 
     // Cleanup.
     let _ = sqlx::query("DELETE FROM mutation_log WHERE entity_id = $1")

@@ -684,6 +684,17 @@ fn check_report_panel(report: &CheckReport, proposal_id: &str, is_risky: bool) -
 
     html! {
         (banner)
+        // Falsifiability: render the timestamp + DC source verbatim so a
+        // reviewer can mutate the DB, click again, and watch this line
+        // change. The count comes from check::check, never from the template.
+        p.hint style="margin-top:8px" {
+            "Report generated at " span.mono { (report.generated_at) }
+            " · " span.mono { (report.elapsed_ms) " ms total"}
+            " · data_conformance source = " span.mono { (dc.source) }
+            @if dc.applicable {
+                " · live count = " span.mono { (dc.violations_found) }
+            }
+        }
         table.checks {
             thead {
                 tr {
@@ -883,21 +894,44 @@ fn verify_panel(report: &VerifyReport) -> Markup {
     };
     html! {
         (banner)
+        p.hint style="margin-top:8px" {
+            "Live verify run at " span.mono { (report.timestamp.to_rfc3339()) } " — every click re-queries Postgres and recomputes checksums."
+        }
         @if !report.tampered_entities.is_empty() {
             h4 style="margin:14px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" { "Tampered rows" }
-            table.data {
-                thead { tr { th { "type" } th { "entity_id" } th { "fields changed" } th { "last_seq" } th { "logged actor" } th { "checksum (live ≠ logged)" } } }
-                tbody {
-                    @for d in &report.tampered_entities {
-                        tr {
-                            td.findings { span.id { (d.entity_type) } }
-                            td.findings { span.id { (d.entity_id) } }
-                            td.findings { (d.fields_changed.join(", ")) }
-                            td.elapsed { (d.last_logged_mutation_seq) }
-                            td.findings { span.mono { (d.last_logged_actor) } }
-                            td.findings { span.mono style="word-break:break-all" {
-                                (truncate_checksum(d.logged_checksum.as_deref())) " ≠ " (truncate_checksum(Some(&d.current_checksum)))
-                            } }
+            // For each tampered entity render a per-row card so the
+            // expected-vs-actual values are visible field by field — that's
+            // the proof reviewers need: not just "drift detected" but
+            // exactly which value changed and what it changed from.
+            @for d in &report.tampered_entities {
+                div.box.error style="margin-top:10px" {
+                    div {
+                        span.strong { "Drift " }
+                        span.id { (d.entity_type) } " · " span.id { (d.entity_id) }
+                    }
+                    dl.kv style="margin-top:8px" {
+                        dt { "logged at" } dd { span.mono { (d.last_logged_at.to_rfc3339()) } " (seq " (d.last_logged_mutation_seq) ")" }
+                        dt { "logged actor" } dd { span.mono { (d.last_logged_actor) } }
+                        dt { "detected via" } dd { span.mono { (d.detected_via) } }
+                        dt { "logged checksum" } dd { span.mono style="word-break:break-all" { (d.logged_checksum.clone().unwrap_or_else(|| "—".into())) } }
+                        dt { "current checksum" } dd { span.mono style="word-break:break-all" { (d.current_checksum) } }
+                    }
+                    h5 style="margin:14px 0 6px; font-size:11.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" {
+                        "Field-level diff (logged vs. live)"
+                    }
+                    table.data {
+                        thead { tr { th { "field" } th { "logged value (in mutation_log)" } th { "current value (in row)" } } }
+                        tbody {
+                            @if d.fields_changed.is_empty() {
+                                tr { td.findings colspan="3" { "(checksum mismatch but no top-level fields differ — payload-level drift)" } }
+                            }
+                            @for field in &d.fields_changed {
+                                tr {
+                                    td.findings { span.mono { (field) } }
+                                    td.findings { span.mono { (json_field_or_dash(&d.logged_state, field)) } }
+                                    td.findings { span.mono style="color:var(--error)" { (json_field_or_dash(&d.current_state, field)) } }
+                                }
+                            }
                         }
                     }
                 }
@@ -1087,6 +1121,22 @@ fn truncate_checksum(c: Option<&str>) -> String {
         Some(s) if s.len() > 12 => format!("{}…", &s[..12]),
         Some(s) => s.to_string(),
         None => "—".into(),
+    }
+}
+
+/// Render the value of `field` from a JSON object as a compact string. Used
+/// by the verify panel to surface logged-vs-current values for tampered
+/// rows. Returns "—" for missing keys and JSON null; primitives render
+/// without quotes; arrays/objects fall back to their compact JSON form so
+/// nested drift is still legible.
+fn json_field_or_dash(v: &serde_json::Value, field: &str) -> String {
+    match v.get(field) {
+        None => "—".into(),
+        Some(serde_json::Value::Null) => "null".into(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
     }
 }
 
