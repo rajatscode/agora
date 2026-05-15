@@ -59,12 +59,25 @@ async fn home_page_renders_all_eight_beats() {
     );
     let body = resp.text().await.expect("body");
 
-    // The wordmark, the HTMX CDN script, and the embedded stylesheet link.
+    // Wordmark + stylesheet link + INLINE HTMX (not the unpkg CDN URL).
+    // Inlining is a demo-day reliability requirement: venue wifi can block
+    // unpkg, in which case CDN-loaded HTMX would silently fail and every
+    // button would do nothing.
     assert!(body.contains("agora"), "expected agora wordmark");
-    assert!(body.contains("htmx.org"), "expected HTMX CDN script tag");
     assert!(
         body.contains("/static/agora.css"),
         "expected stylesheet link"
+    );
+    assert!(
+        !body.contains("unpkg.com"),
+        "HTMX must NOT be loaded from unpkg.com — inline it via include_str!"
+    );
+    // HTMX 1.9.10's UMD bundle starts with this signature; it's the cheapest
+    // way to assert "the actual JS bytes are inlined" without coupling to a
+    // specific minifier output.
+    assert!(
+        body.contains("htmx:load"),
+        "expected inline HTMX bytes (htmx:load event reference) in home page"
     );
 
     // All eight beat numbers must be visible at first paint.

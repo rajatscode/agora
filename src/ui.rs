@@ -59,7 +59,11 @@ use crate::llm::{self, AuthorMode};
 use crate::reuse::{self, ReuseReport};
 use crate::verify::{self, VerifyReport, VerifyStatus};
 
-const HTMX_CDN: &str = "https://unpkg.com/htmx.org@1.9.10";
+/// HTMX v1.9.10 bytes baked into the binary so the demo works on any
+/// network. Loading from unpkg.com would silently fail behind venue
+/// firewalls — buttons render, page looks fine, clicks do nothing. Inlining
+/// makes agorad a true single-binary distribution.
+const HTMX_JS: &str = include_str!("../static/htmx.min.js");
 
 /// Stylesheet bytes baked into the binary. Served verbatim by `css_handler`.
 /// `include_str!` is relative to *this file's directory*, so the path goes
@@ -490,7 +494,7 @@ fn page_layout(title: &str, body: Markup) -> Markup {
                 meta name="viewport" content="width=device-width,initial-scale=1";
                 title { (title) }
                 link rel="stylesheet" href="/static/agora.css";
-                script src=(HTMX_CDN) defer {}
+                script { (PreEscaped(HTMX_JS)) }
                 script { (PreEscaped(TAB_SCRIPT)) }
             }
             body {
@@ -866,6 +870,11 @@ fn tamper_panel(entity_id: &str, new_provider: &str) -> Markup {
         pre.code style="margin-top:10px" { code {
             "UPDATE bank_integrations SET provider = '" (new_provider) "' WHERE id = '" (entity_id) "';"
         } }
+        p.hint style="margin-top:6px" {
+            "(SQL shown above is the logical statement; the handler binds the values via "
+            code { "sqlx::query(...).bind(...)" }
+            " — parameterized, not concatenated.)"
+        }
         div.row.right style="margin-top:14px" {
             button
                 hx-get="/ui/verify"
