@@ -1,0 +1,53 @@
+{
+  "id": "prop_beat6_tighten_email",
+  "domain": "users",
+  "namespace": "core.users",
+  "change_intent": "Tighten Account.email from optional to required.",
+  "rationale": "Compliance review wants every customer record to carry a contact email so we can deliver legally-required notifications. Currently many legacy rows have NULL.",
+  "change": {
+    "kind": "tighten_field",
+    "type_ref": { "namespace": "core.users", "name": "Account" },
+    "field_name": "email",
+    "from_required": false,
+    "to_required": true
+  },
+  "semantic_contract": {
+    "meaning_before": "Account.email is an optional contact handle; many rows have NULL.",
+    "meaning_after": "Every Account is guaranteed to carry a non-null contact email.",
+    "justification": "Refines the meaning of Account by strengthening an invariant.",
+    "invariants": [
+      "Every Account row has a non-null email.",
+      "No new Account can be created without an email."
+    ]
+  },
+  "compatibility": {
+    "shape": "refinement",
+    "semantic": "refinement",
+    "temporal": "refinement",
+    "policy": "additive",
+    "api": "refinement",
+    "storage": "refinement"
+  },
+  "ownership": {
+    "team": "identity-platform",
+    "semantic_steward": "core-ontology"
+  },
+  "tests": [
+    {
+      "name": "no_null_email_post_migration",
+      "kind": "invariant",
+      "assertion": "After migration, no Account row has email = NULL."
+    },
+    {
+      "name": "create_rejects_null_email",
+      "kind": "compatibility",
+      "assertion": "POST /entities/account with email omitted returns 400."
+    }
+  ],
+  "provenance": {
+    "author": "user://compliance-team",
+    "source_prompt": "Tighten Account.email to required for compliance.",
+    "model": "claude-sonnet-4-5",
+    "generated_at": "2026-05-15T01:30:00Z"
+  }
+}

@@ -135,6 +135,22 @@ fn render_proto(p: &OntologyChangeProposal, target: &TypeRef) -> String {
                 name = target.name
             ));
         }
+        Change::TightenField {
+            field_name,
+            from_required,
+            to_required,
+            ..
+        } => {
+            out.push_str(&format!(
+                "// PARTIAL — tighten `{field_name}` on `{name}`: required {from}→{to}.\n\
+                 // Compiler must flip the field's `required` flag and re-run breaking-change check;\n\
+                 // Feature 2's data-conformance axis decides whether real data survives.\n\
+                 message {name} {{\n  // (existing fields elided)\n}}\n",
+                name = target.name,
+                from = from_required,
+                to = to_required,
+            ));
+        }
     }
     out
 }
@@ -271,6 +287,21 @@ fn render_ddl(p: &OntologyChangeProposal, target: &TypeRef) -> String {
                 "COMMENT ON COLUMN {table}.{field_name} IS 'agora.classification={to:?}';\n"
             ));
         }
+        Change::TightenField {
+            field_name,
+            to_required,
+            ..
+        } => {
+            // The actual ALTER is only safe to run AFTER the data-conformance
+            // axis confirms zero violations. We emit it gated by a comment so
+            // a human can run it manually once the backfill plan lands.
+            let null_clause = if *to_required { "SET NOT NULL" } else { "DROP NOT NULL" };
+            out.push_str(&format!(
+                "-- TightenField proposal {pid}: only run AFTER backfill completes.\n\
+                 -- ALTER TABLE {table} ALTER COLUMN {field_name} {null_clause};\n",
+                pid = p.id,
+            ));
+        }
     }
     out
 }
@@ -348,7 +379,9 @@ fn next_version(change: &Change) -> u32 {
         Change::CreateType { spec } => spec.version,
         Change::AddField { field, .. } => field.since_version,
         Change::AddRelation { relation } => relation.since_version,
-        Change::DeprecateField { .. } | Change::ReclassifyField { .. } => 2,
+        Change::DeprecateField { .. }
+        | Change::ReclassifyField { .. }
+        | Change::TightenField { .. } => 2,
     }
 }
 
@@ -368,6 +401,7 @@ fn render_openfga(p: &OntologyChangeProposal, target: &TypeRef) -> Result<String
     match &p.change {
         Change::AddField { field, .. } => classes.push(field.classification.clone()),
         Change::ReclassifyField { to, .. } => classes.push(to.clone()),
+        Change::TightenField { .. } => classes.push(PolicyClass::Internal),
         Change::CreateType { spec } => {
             for f in &spec.fields {
                 if !classes.contains(&f.classification) {

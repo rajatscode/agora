@@ -1,0 +1,35 @@
+{
+  "id": "prop_attack_sqlinj",
+  "domain": "users",
+  "namespace": "core.users",
+  "change_intent": "(attack) tighten with injection payload as field name.",
+  "rationale": "Regression fixture: deslop-f2 flagged that data-conformance interpolated field_name into SQL. This fixture must be rejected (Skipped) by the axis, NOT executed.",
+  "change": {
+    "kind": "tighten_field",
+    "type_ref": { "namespace": "core.users", "name": "Account" },
+    "field_name": "email; DROP TABLE accounts; --",
+    "from_required": false,
+    "to_required": true
+  },
+  "semantic_contract": {
+    "meaning_before": "n/a",
+    "meaning_after": "n/a",
+    "invariants": ["attacker tries to drop accounts.", "axis must refuse."]
+  },
+  "compatibility": {
+    "shape": "refinement",
+    "semantic": "refinement",
+    "temporal": "additive",
+    "policy": "additive",
+    "api": "additive",
+    "storage": "additive"
+  },
+  "ownership": { "team": "redteam", "semantic_steward": null },
+  "tests": [],
+  "provenance": {
+    "author": "redteam://injection-fuzzer",
+    "source_prompt": "drop accounts",
+    "model": "n/a",
+    "generated_at": "2026-05-15T00:00:00Z"
+  }
+}

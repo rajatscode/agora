@@ -220,6 +220,12 @@ pub fn summarise_proposal(p: &OntologyChangeProposal) -> String {
                 s.push_str(d);
             }
         }
+        Change::TightenField { type_ref, field_name, .. } => {
+            s.push_str(&type_ref.fqn());
+            s.push(' ');
+            s.push_str(field_name);
+            s.push_str(" tighten required");
+        }
     }
     s
 }

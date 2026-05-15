@@ -132,6 +132,19 @@ pub enum Change {
     CreateType {
         spec: OntologyType,
     },
+    /// Tighten an existing field's constraints (e.g. nullable→required, widening
+    /// type narrowed). Distinct from AddField because the field already exists
+    /// and the constraint change can invalidate historical rows — Feature 2's
+    /// data-conformance axis is the one that decides whether real data
+    /// survives this.
+    TightenField {
+        type_ref: TypeRef,
+        field_name: String,
+        /// Was the field optional before this proposal? (i.e. `required=false`)
+        from_required: bool,
+        /// Will the field be required after this proposal? (i.e. `required=true`)
+        to_required: bool,
+    },
 }
 
 impl Change {
@@ -139,7 +152,8 @@ impl Change {
         match self {
             Change::AddField { type_ref, .. }
             | Change::DeprecateField { type_ref, .. }
-            | Change::ReclassifyField { type_ref, .. } => type_ref.clone(),
+            | Change::ReclassifyField { type_ref, .. }
+            | Change::TightenField { type_ref, .. } => type_ref.clone(),
             Change::AddRelation { relation } => relation.from.clone(),
             Change::CreateType { spec } => TypeRef {
                 namespace: spec.namespace.clone(),
@@ -275,6 +289,18 @@ impl OntologyChangeProposal {
             Change::CreateType { spec } => {
                 format!("create_type|{}.{}", spec.namespace, spec.name)
             }
+            Change::TightenField {
+                type_ref,
+                field_name,
+                from_required,
+                to_required,
+            } => format!(
+                "tighten_field|{}|{}|{}->{}",
+                type_ref.fqn(),
+                field_name,
+                if *from_required { "required" } else { "optional" },
+                if *to_required { "required" } else { "optional" }
+            ),
         }
     }
 }
