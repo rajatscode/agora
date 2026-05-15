@@ -54,6 +54,7 @@ fn happy_additive() -> OntologyChangeProposal {
             generated_at: "2026-05-15T00:00:00Z".into(),
             trace_id: None,
         },
+        migration: None,
     }
 }
 
@@ -99,6 +100,7 @@ fn risky_tighten() -> OntologyChangeProposal {
             generated_at: "2026-05-15T00:00:00Z".into(),
             trace_id: None,
         },
+        migration: None,
     }
 }
 

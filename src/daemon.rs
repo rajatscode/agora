@@ -36,6 +36,7 @@ use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::agent;
 use crate::artifacts;
 use crate::ast::OntologyChangeProposal;
 use crate::check;
@@ -98,6 +99,8 @@ pub fn router(state: AppState) -> Router {
         .route("/verify", get(run_verify))
         .route("/concepts", get(list_concepts))
         .route("/concepts/:fqn", get(get_concept))
+        // F6 — closed-loop agentic revision
+        .route("/agent/run", post(run_agent_loop))
         // Browser UI (Feature 4)
         .route("/", get(ui::home))
         .route("/ui/propose", post(ui::ui_propose))
@@ -109,6 +112,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/verify", get(ui::ui_verify))
         .route("/ui/concepts", get(ui::concepts_index))
         .route("/ui/concepts/:fqn", get(ui::concept_view_page))
+        .route("/ui/agent", post(ui::ui_agent_run))
         .route("/static/agora.css", get(ui::css_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -500,6 +504,46 @@ async fn list_concepts(State(state): State<AppState>) -> Json<Vec<ConceptSummary
         })
         .collect();
     Json(summaries)
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRunReq {
+    prompt: String,
+}
+
+/// F6 — run the closed-loop agentic revision against `prompt`. Returns the
+/// full `AgentResult` with every attempt's proposal + CheckReport so callers
+/// can render the revision trace.
+async fn run_agent_loop(
+    State(state): State<AppState>,
+    Json(req): Json<AgentRunReq>,
+) -> Result<Json<agent::AgentResult>, ApiError> {
+    if req.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("empty_prompt", "prompt must not be empty"));
+    }
+    let result = agent::agent_loop(&req.prompt, state.catalog.as_slice(), state.pool.as_ref())
+        .await
+        .map_err(|e| ApiError::internal("agent_loop_failed", e))?;
+
+    // Persist the final-attempt proposal + report next to the others so the
+    // existing /proposals listing surfaces them, and so the UI can deep-link.
+    if let Some(final_attempt) = result.attempts.last() {
+        let dir = state.generated_root.join(&final_attempt.proposal.id);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&final_attempt.proposal) {
+                let _ = std::fs::write(dir.join("proposal.json"), bytes);
+            }
+            if let Ok(bytes) = serde_json::to_vec_pretty(&final_attempt.check_report) {
+                let _ = std::fs::write(dir.join("check_report.json"), bytes);
+            }
+            // Also persist the full attempts trail for audit/replay.
+            if let Ok(bytes) = serde_json::to_vec_pretty(&result) {
+                let _ = std::fs::write(dir.join("agent_run.json"), bytes);
+            }
+        }
+    }
+
+    Ok(Json(result))
 }
 
 async fn get_concept(

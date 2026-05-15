@@ -97,29 +97,66 @@ pub async fn run(
         table, field
     );
 
+    // Up-front: does the proposal carry a backfill commitment? If yes, the
+    // gate treats unverifiable-but-mitigated cases (no DB, missing table) as
+    // Advisory instead of Skipped → auto-approval can proceed. If no, the
+    // gate must Skip and block, exactly as before.
+    let has_backfill = proposal
+        .migration
+        .as_ref()
+        .map(|m| m.has_backfill())
+        .unwrap_or(false);
+
     // Step 3 — do we have a DB to query?
     let Some(pool) = db else {
-        return DataConformance {
-            applicable: true,
-            outcome: Outcome::Skipped,
-            violations_found: 0,
-            sample_violations: vec![],
-            query: Some(count_q),
-            query_time_ms: 0,
-            source: "skipped: no DB connection".into(),
+        return if has_backfill {
+            DataConformance {
+                applicable: true,
+                outcome: Outcome::Advisory,
+                violations_found: 0,
+                sample_violations: vec![],
+                query: Some(count_q),
+                query_time_ms: 0,
+                source: "no-db (mitigated: backfill_plan present, unverifiable)".into(),
+            }
+        } else {
+            DataConformance {
+                applicable: true,
+                outcome: Outcome::Skipped,
+                violations_found: 0,
+                sample_violations: vec![],
+                query: Some(count_q),
+                query_time_ms: 0,
+                source: "skipped: no DB connection".into(),
+            }
         };
     };
 
     // Step 4 — schema present? If not, treat as informational skip.
     if !table_exists(pool, table).await {
-        return DataConformance {
-            applicable: true,
-            outcome: Outcome::Skipped,
-            violations_found: 0,
-            sample_violations: vec![],
-            query: Some(count_q),
-            query_time_ms: 0,
-            source: format!("skipped: table `{}` not present", table),
+        return if has_backfill {
+            DataConformance {
+                applicable: true,
+                outcome: Outcome::Advisory,
+                violations_found: 0,
+                sample_violations: vec![],
+                query: Some(count_q),
+                query_time_ms: 0,
+                source: format!(
+                    "table `{}` not present (mitigated: backfill_plan present)",
+                    table
+                ),
+            }
+        } else {
+            DataConformance {
+                applicable: true,
+                outcome: Outcome::Skipped,
+                violations_found: 0,
+                sample_violations: vec![],
+                query: Some(count_q),
+                query_time_ms: 0,
+                source: format!("skipped: table `{}` not present", table),
+            }
         };
     }
 
@@ -159,7 +196,19 @@ pub async fn run(
     }
     let elapsed = started.elapsed().as_millis() as u64;
 
-    let outcome = if n > 0 { Outcome::Fail } else { Outcome::Pass };
+    // Mitigation: when the proposal carries a backfill_plan (computed above),
+    // violations are **acknowledged and addressed** — outcome downgrades from
+    // Fail to Advisory so auto-approval can proceed. Without a plan, N>0
+    // blocks.
+    let (outcome, source) = if n > 0 {
+        if has_backfill {
+            (Outcome::Advisory, "postgres (mitigated: backfill_plan present)".to_string())
+        } else {
+            (Outcome::Fail, "postgres".to_string())
+        }
+    } else {
+        (Outcome::Pass, "postgres".to_string())
+    };
 
     DataConformance {
         applicable: true,
@@ -168,7 +217,7 @@ pub async fn run(
         sample_violations: samples,
         query: Some(count_q),
         query_time_ms: elapsed,
-        source: "postgres".into(),
+        source,
     }
 }
 
