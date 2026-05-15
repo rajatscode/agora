@@ -45,6 +45,7 @@ use crate::entity_write::{self, CreateBankIntegrationCmd, WriteOrigin, TYPE_BANK
 use crate::explorer;
 use crate::llm;
 use crate::seed::{self, ConceptCard};
+use crate::ui;
 use crate::verify;
 
 /// Process-wide handle: a connected pool (or `None` if no DB), the seed
@@ -79,8 +80,14 @@ impl AppState {
 /// Build the Axum router. Exposed so integration tests can mount the same
 /// router against an `axum::serve(TcpListener, app)` without going through
 /// `serve_forever`.
+///
+/// Mounts both the JSON control-plane API (`/proposals`, `/entities`, etc.)
+/// and the Feature-4 browser UI (`/`, `/ui/*`, `/static/*`). The UI handlers
+/// live in `crate::ui` and wrap the SAME library functions the JSON handlers
+/// call; nothing is duplicated.
 pub fn router(state: AppState) -> Router {
     Router::new()
+        // JSON control-plane API
         .route("/health", get(health))
         .route("/proposals", post(create_proposal).get(list_proposals))
         .route("/proposals/:id", get(get_proposal))
@@ -91,6 +98,18 @@ pub fn router(state: AppState) -> Router {
         .route("/verify", get(run_verify))
         .route("/concepts", get(list_concepts))
         .route("/concepts/:fqn", get(get_concept))
+        // Browser UI (Feature 4)
+        .route("/", get(ui::home))
+        .route("/ui/propose", post(ui::ui_propose))
+        .route("/ui/proposals/:id/check", post(ui::ui_check))
+        .route("/ui/proposals/:id/approve", post(ui::ui_approve))
+        .route("/ui/risky-proposal", post(ui::ui_risky_proposal))
+        .route("/ui/write", post(ui::ui_write))
+        .route("/ui/tamper", post(ui::ui_tamper))
+        .route("/ui/verify", get(ui::ui_verify))
+        .route("/ui/concepts", get(ui::concepts_index))
+        .route("/ui/concepts/:fqn", get(ui::concept_view_page))
+        .route("/static/agora.css", get(ui::css_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -65,6 +65,12 @@ async-trait = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 
+# Browser UI (Feature 4) — server-rendered HTML via maud macros.
+# Pure Rust; no template files, no JS bundlers. HTMX is loaded from CDN
+# in the rendered <head>. The `axum` feature adds an IntoResponse impl for
+# `Markup` so handlers can return it directly.
+maud = { version = "0.26", features = ["axum"] }
+
 [build-dependencies]
 prost-build = "0.12"
 
