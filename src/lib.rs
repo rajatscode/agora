@@ -27,3 +27,8 @@ pub mod check_report;
 pub mod axes;
 pub mod auto_approval;
 pub mod db;
+
+pub mod mutation_log;
+pub mod entity_write;
+pub mod verify;
+pub mod explorer;

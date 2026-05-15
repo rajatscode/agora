@@ -11,9 +11,12 @@ use crate::ast::OntologyChangeProposal;
 use crate::check;
 use crate::check_report::CheckReport;
 use crate::db;
+use crate::entity_write::{self, CreateBankIntegrationCmd, WriteOrigin, WriteOutcome};
+use crate::explorer;
 use crate::llm::{self, AuthorMode};
 use crate::reuse::{self, ReuseReport};
 use crate::seed;
+use crate::verify;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +35,71 @@ pub enum Command {
     Propose(ProposeArgs),
     /// Run the multi-axis risk gate on an existing proposal JSON.
     Check(CheckArgs),
+    /// Apply a controlled entity write (atomic INSERT + mutation_log). Today
+    /// the only supported entity is `bank-integration`; the daemon workstream
+    /// will add the rest.
+    Write(WriteArgs),
+    /// Drift detection: compare live entity tables to mutation_log checksums.
+    Verify(VerifyArgs),
+    /// Discovery: render a concept's metadata, lineage, policy and history.
+    Explorer(ExplorerArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WriteArgs {
+    #[command(subcommand)]
+    pub kind: WriteKind,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WriteKind {
+    /// Create or update a BankIntegration row + log the mutation.
+    BankIntegration(WriteBankIntegrationArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WriteBankIntegrationArgs {
+    /// Stable entity id (e.g. "bi_acme").
+    #[arg(long)]
+    pub entity_id: String,
+    /// Provider name (e.g. "plaid", "mx").
+    #[arg(long)]
+    pub provider: String,
+    /// Ontology version under which this write is authored.
+    #[arg(long, default_value_t = 2)]
+    pub ontology_version: i32,
+    /// Where the write originated.
+    #[arg(long, default_value = "cli")]
+    pub origin: String,
+    /// Postgres connection string. Falls back to DATABASE_URL.
+    #[arg(long, env = "DATABASE_URL")]
+    pub db: Option<String>,
+    /// Skip running migrations on startup.
+    #[arg(long)]
+    pub skip_migrate: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct VerifyArgs {
+    /// Postgres connection string. Falls back to DATABASE_URL.
+    #[arg(long, env = "DATABASE_URL")]
+    pub db: Option<String>,
+    /// Skip running migrations on startup.
+    #[arg(long)]
+    pub skip_migrate: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ExplorerArgs {
+    /// Concept FQN, e.g. `core.integrations.BankIntegration`.
+    pub fqn: String,
+    /// Postgres connection string. Optional — without a DB the explorer
+    /// falls back to the offline seed catalog (no version history).
+    #[arg(long, env = "DATABASE_URL")]
+    pub db: Option<String>,
+    /// Skip running migrations on startup.
+    #[arg(long)]
+    pub skip_migrate: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -106,8 +174,125 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Propose(args) => run_propose(args).await,
         Command::Check(args) => run_check(args).await,
+        Command::Write(args) => run_write(args).await,
+        Command::Verify(args) => run_verify(args).await,
+        Command::Explorer(args) => run_explorer(args).await,
     }
 }
+
+async fn run_write(args: WriteArgs) -> Result<()> {
+    match args.kind {
+        WriteKind::BankIntegration(a) => run_write_bank_integration(a).await,
+    }
+}
+
+async fn run_write_bank_integration(args: WriteBankIntegrationArgs) -> Result<()> {
+    eprintln!(
+        "[agora] write: BankIntegration entity_id={} provider={}",
+        args.entity_id, args.provider
+    );
+    let pool = db::connect_optional(args.db.as_deref()).await?;
+    let Some(pool) = pool else {
+        anyhow::bail!("agora write requires a reachable Postgres (set DATABASE_URL or --db)");
+    };
+    if !args.skip_migrate {
+        db::migrate(&pool).await.context("running migrations")?;
+    }
+
+    let origin = match args.origin.as_str() {
+        "cli" => WriteOrigin::Cli,
+        "http-handler" | "http" => WriteOrigin::HttpHandler,
+        other => anyhow::bail!("--origin must be 'cli' or 'http-handler' (got {other:?})"),
+    };
+
+    let cmd = CreateBankIntegrationCmd {
+        entity_id: args.entity_id.clone(),
+        provider: args.provider.clone(),
+    };
+    let outcome: WriteOutcome =
+        entity_write::apply_create_bank_integration(&pool, &cmd, args.ontology_version, origin)
+            .await
+            .context("applying bank_integration write")?;
+
+    eprintln!(
+        "[agora] write: 201 Created entity_id={} mutation_seq={} ontology_version={} checksum={}",
+        outcome.entity_id,
+        outcome.mutation_seq,
+        outcome.ontology_version,
+        outcome.checksum
+    );
+    let json = serde_json::to_string_pretty(&outcome).context("serializing write outcome")?;
+    println!("{json}");
+    Ok(())
+}
+
+async fn run_verify(args: VerifyArgs) -> Result<()> {
+    eprintln!("[agora] verify: scanning entity tables for drift");
+    let pool = db::connect_optional(args.db.as_deref()).await?;
+    let Some(pool) = pool else {
+        anyhow::bail!("agora verify requires a reachable Postgres (set DATABASE_URL or --db)");
+    };
+    if !args.skip_migrate {
+        db::migrate(&pool).await.context("running migrations")?;
+    }
+
+    let report = verify::verify(&pool).await.context("running verify")?;
+    eprintln!(
+        "[agora] verify: status={:?} entities_checked={} drift={} out_of_band={} ({} ms)",
+        report.verify_status,
+        report.entities_checked,
+        report.tampered_entities.len(),
+        report.outofband_entities.len(),
+        report.elapsed_ms,
+    );
+    for finding in &report.tampered_entities {
+        eprintln!(
+            "[agora]   DRIFT {} {} fields={:?} logged_at={} actor={}",
+            finding.entity_type,
+            finding.entity_id,
+            finding.fields_changed,
+            finding.last_logged_at,
+            finding.last_logged_actor,
+        );
+    }
+    for finding in &report.outofband_entities {
+        eprintln!(
+            "[agora]   OUT-OF-BAND {} {}",
+            finding.entity_type, finding.entity_id,
+        );
+    }
+    let json = serde_json::to_string_pretty(&report).context("serializing verify report")?;
+    println!("{json}");
+    Ok(())
+}
+
+async fn run_explorer(args: ExplorerArgs) -> Result<()> {
+    eprintln!("[agora] explorer: loading view for {}", args.fqn);
+    let pool = db::connect_optional(args.db.as_deref()).await?;
+    if let Some(p) = &pool {
+        if !args.skip_migrate {
+            db::migrate(p).await.context("running migrations")?;
+        }
+    } else {
+        eprintln!("[agora] explorer: no DB — version history will be empty (offline mode)");
+    }
+    let view = explorer::explorer(pool.as_ref(), &args.fqn)
+        .await
+        .context("running explorer")?;
+    match view {
+        None => {
+            eprintln!("[agora] explorer: concept {} not found in registry catalog", args.fqn);
+            anyhow::bail!("concept not found: {}", args.fqn);
+        }
+        Some(view) => {
+            let json = serde_json::to_string_pretty(&view)
+                .context("serializing concept view")?;
+            println!("{json}");
+            Ok(())
+        }
+    }
+}
+
 
 async fn run_check(args: CheckArgs) -> Result<()> {
     eprintln!("[agora] check: loading proposal from {}", args.proposal.display());

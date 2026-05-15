@@ -17,6 +17,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 /// files on disk (migrations/001_*, 002_*).
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_seed_accounts.sql");
+const MIGRATION_003: &str = include_str!("../migrations/003_mutation_log_checksum.sql");
 
 /// Connect to Postgres. Returns Ok(None) if DATABASE_URL is unset OR the
 /// connection attempt fails — caller is expected to fall back to a
@@ -58,5 +59,9 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("running migrations/002_seed_accounts.sql")?;
+    sqlx::raw_sql(MIGRATION_003)
+        .execute(pool)
+        .await
+        .context("running migrations/003_mutation_log_checksum.sql")?;
     Ok(())
 }
