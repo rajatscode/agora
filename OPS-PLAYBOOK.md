@@ -12,18 +12,18 @@ Sidekick references: pre-demo checklist in `DEMO-RUNBOOK.md`; runtime rule in `R
 
 **Default is offline.** The demo flow works **fully** without `ANTHROPIC_API_KEY`. Every author-mode pill renders `offline · no API key` honestly; Beat 6½ revision plans come from the deterministic heuristic. This is the safer demo posture and the mode all dry-runs have been validated against.
 
-**If the user wants live LLM for the judge run:**
+**If you want live LLM for a walk-through:**
 
 1. **Set the key in the daemon's environment, then restart.** The daemon caches mode at boot — exporting after launch is too late.
    ```bash
    kill $(lsof -ti:3030)
    ANTHROPIC_API_KEY=sk-ant-... DATABASE_URL=postgres://localhost/agora_dev cargo run --bin agorad
    ```
-2. **Check quota first.** Each full demo run makes **~2 Anthropic tool-use calls** (Beat 1 proposal author + Beat 6½ revise step). Practice runs eat the same budget. **Plan for 4–8 calls per session** (3 practice runs + 1 judge run is realistic).
-3. **Verify with one Beat 1 click.** If the proposal card's pill reads `live · LLM-derived`, you're good. If it reads `offline · API error`, check the key's permissions and tier before going on stage.
+2. **Check quota first.** Each full walk-through makes **~2 Anthropic tool-use calls** (Beat 1 proposal author + Beat 6½ revise step). **Plan for 4–8 calls per session** if you expect to run it a few times.
+3. **Verify with one Beat 1 click.** If the proposal card's pill reads `live · LLM-derived`, you're good. If it reads `offline · API error`, check the key's permissions and tier.
 4. **Mid-demo rate limit is non-fatal.** The pill flips to orange `offline · API error` and the offline fallback fires automatically. This is **by design, not a failure** — narrate it as such (see failure card #4 below).
 
-**Recommendation.** Run the demo in **offline mode** unless live-LLM is specifically required by the judges. Offline mode is faster, free, deterministic, and visibly honest. Live mode is the same architecture with slightly different latency and a non-zero API-error risk you have to monitor.
+**Recommendation.** Run in **offline mode** unless live-LLM is specifically required. Offline mode is faster, free, deterministic, and visibly honest. Live mode is the same architecture with slightly different latency and a non-zero API-error risk to monitor.
 
 ---
 
@@ -145,7 +145,7 @@ Sidekick references: pre-demo checklist in `DEMO-RUNBOOK.md`; runtime rule in `R
 1. **Confess to the audience.** Name what you see. ("That count should be 47; it's 46 — a prior run modified the table. Let me reset.")
 2. **Don't fight the demo.** If a beat truly won't recover in 30 seconds, narrate it from `DEMO.md` while moving to the next beat. The script's seven other beats land the thesis without any one of them.
 3. **The system's job is to surface degraded modes, not hide them.** Every fallback above corresponds to a UI signal Agora already gives you (orange pill, `Skipped` axis, `Stalled` banner, `tampered_entities[]` array). Use them.
-4. **If multiple things go wrong simultaneously,** abandon live demo, switch to narrating from `DEMO.md` v2.0 with `PITCH.md`'s killer demonstrations as the spine. The story still wins.
+4. **If multiple things go wrong simultaneously,** abandon the live walk and narrate from `DEMO.md` directly. The thesis still lands without any single beat.
 
 ---
 

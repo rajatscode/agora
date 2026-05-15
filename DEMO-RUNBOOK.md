@@ -1,16 +1,16 @@
-# Agora — Demoer Runbook
+# Agora — Walk-Through Runbook
 
-The on-stage script. Read this once before going live. Each beat tells you exactly **what to click**, **what to look for**, **what to say**, and the one **cosmetic thing to ignore**. Recording-grade dry-run captured on `dc08e3f` (F9 + B-lock).
+A click-by-click script for walking through Agora end-to-end. Each step tells you what to click, what to look for, what to say (if you are narrating to someone), and the one cosmetic thing to ignore.
 
 ---
 
-## Pre-demo checklist (do this 5 minutes before)
+## Pre-flight checklist (do this 5 minutes before)
 
-1. **Daemon up.** `curl localhost:3030/health` returns `{"db":"connected","status":"ok"}`. Note the PID — if it dies mid-demo, you'll need to `cargo run --bin agorad` again.
-2. **Baselines correct.** `psql postgres://localhost/agora_dev -c "SELECT (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts) AS account_nulls, (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM customers) AS customer_nulls, (SELECT COUNT(*) FILTER (WHERE resolved_at IS NULL) FROM audit_findings) AS af_unresolved;"` must show **47 / 5 / 4** (Beat 6 / Customer agent loop / AuditFinding agent loop hero numbers — fresh-DB seed values; ignore prior writes by running `curl -X POST /admin/reset` first to restore baselines).
+1. **Daemon up.** `curl localhost:3030/health` returns `{"db":"connected","status":"ok"}`. Note the PID — if it dies, you'll need to `cargo run --bin agorad` again.
+2. **Baselines correct.** `psql postgres://localhost/agora_dev -c "SELECT (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts) AS account_nulls, (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM customers) AS customer_nulls, (SELECT COUNT(*) FILTER (WHERE resolved_at IS NULL) FROM audit_findings) AS af_unresolved;"` must show **47 / 5 / 4**. If not, `curl -X POST /admin/reset` restores baselines.
 3. **Browser ready.** Fresh tab on `http://localhost:3030/`. Confirm you see all nine section headers: `01 / 02`, `03`, `05`, `06`, `06½`, `07`, `08` plus the intro card.
-4. **Console clean.** Open devtools briefly — no exceptions on page load (tab-switch fix landed in F4).
-5. **Have one DB query in your pocket.** `SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts;` — if a judge asks "is the 47 real?", run it live in a second terminal.
+4. **Console clean.** Open devtools briefly — no exceptions on page load.
+5. **Have one DB query in your pocket.** `SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts;` — if someone wants to verify the 47, run it live in a second terminal.
 
 ---
 
@@ -35,7 +35,7 @@ The on-stage script. Read this once before going live. Each beat tells you exact
 
 **Narration:** *"Natural-language prompt becomes a typed proposal. Reuse detection runs against the seed catalogue in the same pass — the best match is 8 percent, so this lands as a New concept, not a reuse-of-existing-one."*
 
-**Watch out for:** Author mode says `offline · no API key` — that's by design when ANTHROPIC_API_KEY isn't set. If a judge asks, *"the same code path calls Anthropic when the key is set; the UI surfaces author mode honestly."*
+**Watch out for:** Author mode says `offline · no API key` — that's by design when ANTHROPIC_API_KEY isn't set. If asked, *"the same code path calls Anthropic when the key is set; the UI surfaces author mode honestly."*
 
 ---
 
@@ -86,7 +86,7 @@ The on-stage script. Read this once before going live. Each beat tells you exact
 
 **Narration:** *"This proposal asks to tighten Account.email from optional to required. Forty-seven rows in the live accounts table would violate. The block is real — that count came from Postgres at click time."*
 
-**Watch out for:** If a judge wants proof, run `psql postgres://localhost/agora_dev -c "SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts;"` in a second terminal. It returns `47`. We tested 47→48→47 by INSERT/DELETE during F4 val; the UI tracks live.
+**Watch out for:** If anyone wants proof, run `psql postgres://localhost/agora_dev -c "SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts;"` in a second terminal. It returns `47`. We tested 47→48→47 by INSERT/DELETE during F4 val; the UI tracks live.
 
 ---
 
@@ -118,7 +118,7 @@ The on-stage script. Read this once before going live. Each beat tells you exact
 - Then "Write committed." card with `entity_id: bi_demo_xxxxxxxxxx`, `mutation_seq` (incrementing each demo), `ontology_version: 2`, full SHA-256 checksum.
 
 **Narration:** *"The actor is part of the request. The policy engine looks up the bank_integration:owner relation, sees team:integrations-platform on the wildcard, allows, and the write goes through inside a single transaction with the mutation_log entry."*
-**Watch out for:** **The actor is stated, not authenticated.** This is a hackathon demo of FGA-style policy *enforcement*, not of auth-token issuance. If a judge presses, *"we treat the actor as supplied by the caller's auth proxy in production; the contribution here is the enforcement graph, not the identity step."*
+**Watch out for:** **The actor is stated, not authenticated.** This is a demonstration of FGA-style policy *enforcement*, not of auth-token issuance. If pressed, *"the actor would be supplied by the caller's auth proxy in production; the contribution here is the enforcement graph, not the identity step."*
 
 ---
 
@@ -236,7 +236,7 @@ The on-stage script. Read this once before going live. Each beat tells you exact
 >
 > *"Same agent code. Three domain-shaped strategies, automatically. That's what 'generalization' means in this codebase."*
 
-**Watch out for:** The three SQLs are real, byte-for-byte, from F6/F8/F9 val passes. You can run any of them live (`curl -X POST -d '{"prompt":"tighten <X>.<field> to required"}' http://localhost:3030/agent/run | jq '.attempts[1].proposal.migration'`) if a judge wants proof.
+**Watch out for:** The three SQLs are real, byte-for-byte. You can run any of them live (`curl -X POST -d '{"prompt":"tighten <X>.<field> to required"}' http://localhost:3030/agent/run | jq '.attempts[1].proposal.migration'`) if anyone wants proof.
 
 ---
 
@@ -256,7 +256,7 @@ These three are known limitations. **Stating them shows craft. Hiding them invit
 
 - **Beat 1 propose times out (LLM call slow):** Refresh, the offline-fallback author is deterministic and instant. Note: this is the first beat — bias toward retrying once before falling back to a different prompt.
 - **Beat 6 risky proposal returns wrong number:** Check `psql … FROM accounts WHERE email IS NULL` and recover narration with the actual number. The point is "it's live"; the specific count is secondary.
-- **Beat 6½ agent loop fails to revise (attempt 2 also blocked):** Confess on stage: *"The agent is allowed up to 3 attempts; in this run it didn't converge. The structured-rejection contract still holds — every attempt is on the record. We've seen converge 99% of the time on this prompt; happy to dig in offline."*
+- **Beat 6½ agent loop fails to revise (attempt 2 also blocked):** State it plainly: *"The agent is allowed up to 3 attempts; in this run it didn't converge. The structured-rejection contract still holds — every attempt is on the record. It converges ~99% of the time on this prompt."*
 - **Beat 7c verify shows zero drift:** Means the tamper button didn't fire. Click it again, then verify. If still zero, the daemon may have restarted between tamper and verify (mutation_log + DB consistent again). Recover with: *"a fresh daemon start means everything reconciles — let me re-tamper to show the detection live."*
 - **Concept page 404:** Type-mismatch in URL. Use the concepts list (`/ui/concepts`) as the source of truth for FQNs.
 
@@ -268,4 +268,4 @@ These three are known limitations. **Stating them shows craft. Hiding them invit
 
 ---
 
-**Built on**: `dc08e3f` (F1 → F9, 83 tests passing). Daemon: `cargo run --bin agorad` with `DATABASE_URL=postgres://localhost/agora_dev`. Browser: any Chromium. Run time: ~12 minutes including narration.
+Daemon: `cargo run --bin agorad` with `DATABASE_URL=postgres://localhost/agora_dev`. Browser: any Chromium. Run time: ~12 minutes including narration.

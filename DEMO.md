@@ -2,7 +2,7 @@
 
 **Status:** v2.0 — **Locked.** Adds Beat 6½ (closed-loop agent revision), strengthens Beat 7's verify with field-level tamper diffs, and ties Beat 8 into the verify report. All beats are wired in the F4 browser UI and run live against the F-DAEMON HTTP control plane. See Decision Log for the v2.0 changes.
 
-**Audience:** Hackathon judges and reviewers. They have ~5 minutes of attention. They are skeptical of toy demos. They want to see real operational behavior, not screenshots.
+**Audience:** Someone walking through Agora for the first time. ~5–10 minutes of attention. Wants to see real operational behavior, not screenshots.
 
 **Date:** 2026-05-15
 
@@ -26,7 +26,7 @@ Everything happens in one browser tab against one binary.
 
 - **Runtime:** `agorad` (single Rust binary) listening on **`http://localhost:3030`**.
 - **UI:** F4 browser UI at `/` renders every beat as its own section. HTMX swaps each beat's response into a slot in place — no page reloads, no URL bar gymnastics, every prior beat stays visible.
-- **No demo-mode toggle.** The `/ui/*` HTMX handlers wrap the same library functions (`llm::author_proposal`, `check::check`, `verify::verify`, `explorer::explorer`, `entity_write::*`, `agent::agent_loop`) that the JSON daemon and the `agora` CLI use. The judges see the same code path any caller would.
+- **No demo-mode toggle.** The `/ui/*` HTMX handlers wrap the same library functions (`llm::author_proposal`, `check::check`, `verify::verify`, `explorer::explorer`, `entity_write::*`, `agent::agent_loop`) that the JSON daemon and the `agora` CLI use. The browser sees the same code path any caller would.
 - **Live mode vs. offline mode** is determined by whether `ANTHROPIC_API_KEY` is set. Each beat surfaces an explicit author-mode pill (`live · LLM-derived` or `offline · …`). Honest framing is part of the demo, not hidden.
 
 ---
@@ -77,7 +77,7 @@ Each beat lists: **what happens on screen**, **what it proves**, and **what woul
 
 For the `BankIntegrationCapability` proposal every axis comes back clean. `auto_approval_eligible = true`.
 
-**What it proves:** Compatibility is **multi-axis**, not just shape-compatible vs. shape-breaking. Shape checks aren't enough; meaning, policy, and *the actual state of the world* need validation. The "live count" line is the falsifiability marker — judges can perturb the DB and watch the check update.
+**What it proves:** Compatibility is **multi-axis**, not just shape-compatible vs. shape-breaking. Shape checks aren't enough; meaning, policy, and *the actual state of the world* need validation. The "live count" line is the falsifiability marker — you can perturb the DB and watch the check update.
 
 **Cannot be faked:** The impact list must come from real registry lineage. The data-conformance count must come from a real query. The elapsed-ms columns must be wall-clock from the run that just happened.
 
@@ -116,7 +116,7 @@ GraphQL and gRPC service stubs are **explicitly cut for the hackathon**.
 
 **What it proves:** Agora **catches the failure mode that breaks every shared-data system in practice** — the change that compiles cleanly, passes shape checks, and would silently turn 47 records into invariant violations. The block is grounded in *the actual state of the world*, not in a hypothetical lint rule.
 
-**Cannot be faked:** The 47 NULL `email` rows must be real rows in the `Account` table. The card surfaces the verbatim SQL `query` that produced the count — judges can copy-paste it into psql and replicate.
+**Cannot be faked:** The 47 NULL `email` rows must be real rows in the `Account` table. The card surfaces the verbatim SQL `query` that produced the count — anyone can copy-paste it into psql and replicate.
 
 ---
 
