@@ -3,25 +3,59 @@ name = "agora"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "agora"
+path = "src/main.rs"
+
+[lib]
+name = "agora"
+path = "src/lib.rs"
+
 [dependencies]
+# HTTP server (other workstreams)
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-anyhow = "1"
-thiserror = "1"
+
+# Serde / data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Storage (other workstreams; kept for compile-compat)
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "json", "chrono"] }
+
+# Protobuf — runtime ingest decode (other workstreams). NOT used for codegen by WS-A.
 prost = "0.12"
 prost-types = "0.12"
+
+# Errors / logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+
+# CLI + HTTP client (Feature 1)
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Anthropic SDK (locked stack pick)
 anthropic-sdk = "0.1"
+
+# Local embeddings:
+# Hackathon: fastembed-rs pulls in hf-hub → ureq, whose TLS-feature wiring
+# clashes with our rustls choice. Until that's resolved we use a deterministic
+# offline hashed-bag-of-words cosine (see `src/reuse.rs`). The `Embedder` trait
+# isolates the choice so we can swap fastembed in without touching call sites.
+# fastembed = { version = "3", ... }
+
+# Misc
 regex = "1"
 async-trait = "0.1"
+sha2 = "0.10"
+hex = "0.4"
 
 [build-dependencies]
 prost-build = "0.12"
