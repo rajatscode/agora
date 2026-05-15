@@ -41,8 +41,12 @@ thiserror = "1"
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Anthropic SDK (locked stack pick)
-anthropic-sdk = "0.1"
+# Anthropic API: hand-rolled reqwest + tool-use structured output. The
+# `anthropic-sdk` 0.1 crate was originally listed in STACK.md but it doesn't
+# expose tool-use structured output — and re-shaping our schema-emit path
+# around its API would have cost more than the direct call (which is ~80
+# lines, all in src/llm.rs). When the SDK adds structured-output support
+# we can swap call_anthropic() for it without touching call sites.
 
 # Local embeddings:
 # Hackathon: fastembed-rs pulls in hf-hub → ureq, whose TLS-feature wiring

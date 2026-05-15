@@ -51,7 +51,7 @@ pub fn emit_all(proposal: &OntologyChangeProposal, root: &Path) -> Result<Artifa
     fs::write(&proto_path, render_proto(proposal, &target))?;
     fs::write(&ddl_path, render_ddl(proposal, &target))?;
     fs::write(&handler_path, render_handler(proposal, &target))?;
-    fs::write(&fga_path, render_openfga(proposal, &target))?;
+    fs::write(&fga_path, render_openfga(proposal, &target)?)?;
 
     Ok(ArtifactManifest {
         proposal_id: proposal.id.clone(),
@@ -336,18 +336,25 @@ fn render_handler(p: &OntologyChangeProposal, target: &TypeRef) -> String {
     )
 }
 
+/// Pick the `ontology_version` the generated handler should stamp into
+/// mutation_log rows. For Add* variants the field/relation carries it;
+/// for `CreateType` the spec does. For `Deprecate`/`Reclassify` we don't
+/// have a baseline to bump from at codegen time, so we conservatively
+/// stamp `2` — bumped from the implicit baseline of `1`. The compiler
+/// workstream (WS-B) will replace this with a real lookup against the
+/// type registry once it lands.
 fn next_version(change: &Change) -> u32 {
     match change {
         Change::CreateType { spec } => spec.version,
         Change::AddField { field, .. } => field.since_version,
         Change::AddRelation { relation } => relation.since_version,
-        _ => 2,
+        Change::DeprecateField { .. } | Change::ReclassifyField { .. } => 2,
     }
 }
 
 // -------- OpenFGA tuples --------
 
-fn render_openfga(p: &OntologyChangeProposal, target: &TypeRef) -> String {
+fn render_openfga(p: &OntologyChangeProposal, target: &TypeRef) -> Result<String> {
     // Emit a small JSON document containing:
     //   - the FGA "type" the runtime should register for this concept
     //   - example tuples for each PolicyClass the proposal touches.
@@ -409,7 +416,7 @@ fn render_openfga(p: &OntologyChangeProposal, target: &TypeRef) -> String {
         "model": model,
         "tuples": tuples,
     }))
-    .unwrap()
+    .context("serializing OpenFGA artifact to JSON")
 }
 
 fn canonical_tuple(

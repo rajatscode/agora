@@ -455,6 +455,12 @@ fn author_add_field_on(
         field: Field {
             name: field_name.to_string(),
             proto_type: ProtoType::Bool,
+            // Heuristic-author placeholder. Real proto field numbers must be
+            // unique within the parent message, monotonic, and skip the
+            // 19000–19999 reserved range — the compiler workstream (WS-B)
+            // is responsible for renumbering against the live message
+            // when it merges this partial proto. Picked 17 as a hex-pretty
+            // value that's clearly synthetic.
             proto_number: 17,
             required: false,
             since_version: 2,

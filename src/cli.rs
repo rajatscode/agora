@@ -165,7 +165,9 @@ async fn run_propose(args: ProposeArgs) -> Result<()> {
     };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&outcome).unwrap());
+        let json = serde_json::to_string_pretty(&outcome)
+            .context("serializing propose outcome to JSON")?;
+        println!("{}", json);
     } else {
         // Compact one-screen summary for humans / demo.
         println!();

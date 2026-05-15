@@ -1,19 +1,26 @@
 //! Three-layer reuse detection.
 //!
 //! Layer 1 — exact match on `OntologyChangeProposal::signature()`:
-//!           identical change against an identical concept = `Duplicate`.
-//! Layer 2 — Jaccard similarity over tokenised summaries:
-//!           cheap, deterministic, surfaces obvious near-dupes.
-//! Layer 3 — embedding cosine. Spec calls for fastembed-rs; see Cargo.toml
-//!           for why the hackathon build uses a deterministic hashed-bag-of-
-//!           words embedding behind an `Embedder` trait. Swap implementations
-//!           by changing `default_embedder()` — call sites are stable.
+//!           identical change against an identical concept = `Duplicate`,
+//!           targeting an existing concept = `Refinement`. Returns early.
+//! Layers 2+3 — combined similarity pass. For every concept card we compute
+//!              BOTH the Jaccard similarity over tokenised summaries (Layer 2,
+//!              cheap deterministic baseline) AND the cosine over a 256-d
+//!              embedding (Layer 3, semantic-aware). Each `ReuseHit` carries
+//!              both raw scores plus a fused `score = 0.5*jaccard + 0.5*cosine`
+//!              that the classifier ranks on. Fused in one pass for clarity;
+//!              splitting into two sequential passes wouldn't change behaviour.
+//!
+//!              Spec calls for fastembed-rs; see Cargo.toml for why the
+//!              hackathon build uses a deterministic hashed-bag-of-words
+//!              embedding behind an `Embedder` trait. Swap implementations
+//!              by changing `default_embedder()` — call sites are stable.
 //! (Bonus) — top-K hits are an LLM-judge candidate set; tagged TODO below.
 //!
 //! Classification: `New | Reuse | Refinement | Duplicate`.
 //!
-//! Per spec: ONE embedding call per reuse check. We embed the proposal's
-//! summary once, then dot-product against pre-embedded concept cards.
+//! Per spec: ONE embedding call per reuse check (per proposal-side; concept
+//! cards would be pre-embedded in the live registry).
 
 use std::collections::HashSet;
 
