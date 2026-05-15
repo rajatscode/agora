@@ -1,0 +1,1161 @@
+//! Browser demo UI — Feature 4 (impl-f4).
+//!
+//! Server-rendered HTML via maud + interactivity via HTMX (loaded from CDN).
+//! There is **no JavaScript framework, no bundler, no Node toolchain**:
+//! every byte the browser sees is either Rust-emitted HTML, the single
+//! `static/agora.css` file, or `htmx.org` from unpkg.
+//!
+//! This file is the UI counterpart to `src/daemon.rs`. The JSON daemon
+//! handlers stay; the `/ui/*` handlers below wrap the SAME library
+//! functions (`llm::author_proposal`, `check::check`, `verify::verify`,
+//! `explorer::explorer`, `entity_write::*`) and render their results as
+//! HTMX-friendly HTML fragments. Beats 1-8 of `DEMO.md` map onto the
+//! routes registered here:
+//!
+//!   GET  /                             → home (all 8 beats laid out)
+//!   POST /ui/propose                   → Beats 1+2 (proposal card, reuse hits, artifact tabs)
+//!   POST /ui/proposals/{id}/check      → Beat 3 (7-axis check report)
+//!   POST /ui/proposals/{id}/approve    → Beat 5 (auto-approval verdict)
+//!   POST /ui/risky-proposal            → Beat 6 (pre-baked risky thread; live block)
+//!   POST /ui/write                     → Beat 7a (write a BankIntegration)
+//!   POST /ui/tamper                    → Beat 7b (raw-SQL tamper, DEMO-ONLY)
+//!   GET  /ui/verify                    → Beat 7c (drift detection report)
+//!   GET  /ui/concepts                  → Beat 8 (concept list)
+//!   GET  /ui/concepts/{fqn}            → Beat 8 (full ConceptView)
+//!   GET  /static/agora.css             → embedded stylesheet
+//!
+//! All HTML is rendered with `maud::html!` macros so escaping is automatic.
+//! Inline strings that need to be inserted as raw HTML (rare; one tiny
+//! tab-switching script in the home <head>) use `PreEscaped`.
+//!
+//! Why fragments and not full pages for the action endpoints: HTMX swaps
+//! by id. Each beat owns a `#beat-N-slot` div on the home page; the
+//! response replaces only that slot. The page never reloads, the
+//! presenter never touches the URL bar, and every beat stays visible the
+//! whole way through the demo.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use axum::{
+    extract::{Path as AxumPath, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    Form,
+};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
+use serde::Deserialize;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::artifacts;
+use crate::ast::OntologyChangeProposal;
+use crate::check;
+use crate::check_report::{Axis, CheckReport, DataConformance, Outcome, SampleViolation};
+use crate::daemon::AppState;
+use crate::entity_write::{self, CreateBankIntegrationCmd, WriteOrigin, WriteOutcome};
+use crate::explorer::{self, ConceptView};
+use crate::llm::{self, AuthorMode};
+use crate::reuse::{self, ReuseReport};
+use crate::verify::{self, VerifyReport, VerifyStatus};
+
+const HTMX_CDN: &str = "https://unpkg.com/htmx.org@1.9.10";
+
+/// Stylesheet bytes baked into the binary. Served verbatim by `css_handler`.
+/// `include_str!` is relative to *this file's directory*, so the path goes
+/// up one level out of `src/` then into `static/`.
+const AGORA_CSS: &str = include_str!("../static/agora.css");
+
+/// Tiny vanilla-JS helper that wires the artifact tab strip. Six lines, no
+/// framework. Inlined into the home page <head> so subsequent HTMX-injected
+/// fragments can simply emit `.tab` / `.tab-panel` markup and have it work.
+const TAB_SCRIPT: &str = r#"
+function agoraSelectTab(group, name) {
+  document.querySelectorAll('[data-tab-group="'+group+'"]').forEach(function(el){
+    el.classList.toggle('active', el.dataset.tabName === name);
+  });
+}
+document.body.addEventListener('click', function(e) {
+  var t = e.target.closest('[data-tab-trigger]');
+  if (!t) return;
+  agoraSelectTab(t.dataset.tabGroup, t.dataset.tabName);
+});
+"#;
+
+// ============================================================================
+// Static asset
+// ============================================================================
+
+pub async fn css_handler() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        AGORA_CSS,
+    )
+        .into_response()
+}
+
+// ============================================================================
+// Page-level routes
+// ============================================================================
+
+pub async fn home() -> Markup {
+    page_layout("Agora — demo", html! {
+        (intro_block())
+
+        (beat_section(
+            "01 / 02",
+            "Propose a concept (LLM-authored)",
+            "An agent describes a new concept in natural language. Agora calls Anthropic with a structured-output schema and the proposal arrives typed. Reuse detection runs against the seed catalog in the same pass.",
+            html! {
+                form
+                    hx-post="/ui/propose"
+                    hx-target="#beat-1-slot"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="find button"
+                {
+                    textarea
+                        name="prompt"
+                        rows="3"
+                        placeholder="we need to model what each bank integration can do — supported features, rate limits, etc." {
+                        "we need to model what each bank integration can do — supported features, rate limits, etc."
+                    }
+                    div.row.right {
+                        button type="submit" { "Propose →" }
+                    }
+                    p.hint { "Live LLM call when ANTHROPIC_API_KEY is set; deterministic offline author otherwise. The author mode is shown on the response card." }
+                }
+                div id="beat-1-slot" {}
+            },
+        ))
+
+        (beat_section(
+            "03",
+            "Multi-axis check report",
+            "Eight checks run against the proposal: composition, shape, semantic (LLM), policy, temporal, impact, replay, and a live data-conformance query. Each row carries an outcome, evidence source, and elapsed time.",
+            html! {
+                div.hint { "After proposing above, run the checks against the resulting proposal." }
+                div id="beat-3-slot" {}
+            },
+        ))
+
+        (beat_section(
+            "05",
+            "Auto-approval verdict",
+            "If every axis is clean (advisory and skipped count as non-failure), the proposal is auto-approval-eligible. The verdict comes from the same predicate any caller — CLI or HTTP — would see.",
+            html! {
+                div.hint { "Available once the check report has been produced." }
+                div id="beat-5-slot" {}
+            },
+        ))
+
+        (beat_section(
+            "06",
+            "Risky proposal blocked by real data",
+            "A second, pre-baked proposal asks to tighten Account.email from optional to required. Agora's data-conformance axis runs a real query against the live Account table; the count it surfaces is the count that exists right now.",
+            html! {
+                form
+                    hx-post="/ui/risky-proposal"
+                    hx-target="#beat-6-slot"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="find button"
+                {
+                    div.row {
+                        button type="submit" { "Run risky proposal →" }
+                        span.hint { "Loads " code { "fixtures/beat6_tighten_account_email.json" } " and runs " code { "check::check" } " against it." }
+                    }
+                }
+                div id="beat-6-slot" {}
+            },
+        ))
+
+        (beat_section(
+            "07",
+            "Write → tamper → verify",
+            "A controlled write creates a BankIntegration row and a mutation_log entry inside one transaction. Then we issue a raw SQL UPDATE that bypasses the handler. Then agora verify reproduces the canonical-JSON checksum and surfaces the drift.",
+            html! {
+                form
+                    hx-post="/ui/write"
+                    hx-target="#beat-7a-slot"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="find button"
+                {
+                    div.row {
+                        label for="provider" { "Provider " }
+                        input type="text" name="provider" value="plaid" style="max-width:200px" {}
+                        button type="submit" { "Write a BankIntegration →" }
+                    }
+                    p.hint { "The entity_id is generated server-side. The response carries " code { "mutation_seq" } " and the SHA-256 checksum that was logged." }
+                }
+                div id="beat-7a-slot" {}
+                div id="beat-7b-slot" {}
+                div id="beat-7c-slot" {}
+            },
+        ))
+
+        (beat_section(
+            "08",
+            "Explorer — owner, invariants, lineage, policy, history",
+            "Discovery as a first-class output of the control plane. Every field below is derived from the registry plus the live mutation_log; nothing is hand-painted for the demo.",
+            html! {
+                p.hint { "Open a concept to see the explorer view." }
+                ul.concept-list {
+                    li {
+                        a href="/ui/concepts/core.integrations.BankIntegration" {
+                            span.fqn { "core.integrations.BankIntegration" }
+                            span.team { "owner: integrations-platform" }
+                        }
+                    }
+                    li {
+                        a href="/ui/concepts/core.integrations.AuthenticationMethod" {
+                            span.fqn { "core.integrations.AuthenticationMethod" }
+                            span.team { "owner: integrations-platform" }
+                        }
+                    }
+                    li {
+                        a href="/ui/concepts/core.users.Account" {
+                            span.fqn { "core.users.Account" }
+                            span.team { "owner: identity-platform" }
+                        }
+                    }
+                    li {
+                        a href="/ui/concepts" { "All concepts →" }
+                    }
+                }
+            },
+        ))
+    })
+}
+
+pub async fn concepts_index(State(state): State<AppState>) -> Markup {
+    let items: Vec<Markup> = state
+        .catalog
+        .iter()
+        .map(|c| {
+            let fqn = c.fqn.clone();
+            html! {
+                li {
+                    a href=(format!("/ui/concepts/{fqn}")) {
+                        span.fqn { (fqn) }
+                        span.team { "owner: " (c.spec.ownership.team) " · v" (c.spec.version) }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    page_layout("Concepts — Agora", html! {
+        (nav_back("/", "← back to demo"))
+        div.beat {
+            div.beat-head {
+                span.beat-num { "08" }
+                h2.beat-title { "Registered concepts" }
+            }
+            p.beat-sub { (items.len()) " concepts in the seed catalog. Click any to open the explorer." }
+            ul.concept-list {
+                @for item in &items { (item) }
+            }
+        }
+    })
+}
+
+pub async fn concept_view_page(
+    State(state): State<AppState>,
+    AxumPath(fqn): AxumPath<String>,
+) -> Result<Markup, UiError> {
+    let view = explorer::explorer(state.pool.as_ref(), &fqn)
+        .await
+        .map_err(|e| UiError::internal(format!("explorer failed: {e}")))?;
+    let view = view.ok_or_else(|| UiError::not_found(format!("no concept named {fqn:?}")))?;
+
+    Ok(page_layout(&format!("{fqn} — Agora"), html! {
+        (nav_back("/ui/concepts", "← all concepts"))
+        (concept_view_markup(&view, state.pool.is_some()))
+    }))
+}
+
+// ============================================================================
+// HTMX fragment endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ProposeForm {
+    pub prompt: String,
+}
+
+pub async fn ui_propose(
+    State(state): State<AppState>,
+    Form(form): Form<ProposeForm>,
+) -> Result<Markup, UiError> {
+    if form.prompt.trim().is_empty() {
+        return Err(UiError::bad_request("prompt is empty"));
+    }
+
+    let actor = "agent://agora-browser-demo";
+    let (proposal, mode) = llm::author_proposal(&form.prompt, actor)
+        .await
+        .map_err(|e| UiError::internal(format!("author_proposal failed: {e}")))?;
+
+    let manifest = artifacts::emit_all(&proposal, &state.generated_root)
+        .map_err(|e| UiError::internal(format!("artifact emit failed: {e}")))?;
+
+    // Persist the proposal alongside its artifacts so /check can read it.
+    let proposal_path = Path::new(&manifest.directory).join("proposal.json");
+    let bytes = serde_json::to_vec_pretty(&proposal)
+        .map_err(|e| UiError::internal(format!("serialize proposal failed: {e}")))?;
+    std::fs::write(&proposal_path, &bytes).map_err(|e| {
+        UiError::internal(format!(
+            "writing {}: {e}",
+            proposal_path.display()
+        ))
+    })?;
+
+    let reuse_report = reuse::classify(&proposal, state.catalog.as_slice());
+
+    Ok(proposal_card(&proposal, &mode, &manifest, &reuse_report))
+}
+
+pub async fn ui_check(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Markup, UiError> {
+    let dir = state.generated_root.join(&id);
+    let proposal_path = dir.join("proposal.json");
+    if !proposal_path.exists() {
+        return Err(UiError::not_found(format!(
+            "proposal {id:?} has no proposal.json on disk"
+        )));
+    }
+    let proposal = load_proposal(&proposal_path)
+        .map_err(|e| UiError::internal(format!("load proposal: {e}")))?;
+
+    let report = check::check(&proposal, state.catalog.as_slice(), state.pool.as_ref())
+        .await
+        .map_err(|e| UiError::internal(format!("check::check failed: {e}")))?;
+
+    // Cache for /check_report and /approve to read.
+    if let Ok(bytes) = serde_json::to_vec_pretty(&report) {
+        let _ = std::fs::write(dir.join("check_report.json"), bytes);
+    }
+
+    Ok(check_report_panel(&report, &proposal.id, false))
+}
+
+pub async fn ui_approve(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Markup, UiError> {
+    let dir = state.generated_root.join(&id);
+    let report_path = dir.join("check_report.json");
+    if !report_path.exists() {
+        return Err(UiError::bad_request(
+            "run the check before approving — no check_report.json on disk",
+        ));
+    }
+    let raw = std::fs::read_to_string(&report_path)
+        .map_err(|e| UiError::internal(format!("read report: {e}")))?;
+    let report: CheckReport = serde_json::from_str(&raw)
+        .map_err(|e| UiError::internal(format!("parse report: {e}")))?;
+    Ok(approval_panel(&report))
+}
+
+pub async fn ui_risky_proposal(
+    State(state): State<AppState>,
+) -> Result<Markup, UiError> {
+    // Load the pre-baked TightenField proposal from fixtures, copy it into
+    // the generated root so subsequent /check & /approve calls work, then
+    // run the check live. The 47-violation count comes from
+    // axes::data_conformance::run, which runs SELECT COUNT(*) ... IS NULL
+    // against the real Account table.
+    let fixture_path = Path::new("fixtures").join("beat6_tighten_account_email.json");
+    let raw = std::fs::read_to_string(&fixture_path).map_err(|e| {
+        UiError::internal(format!(
+            "reading fixture {}: {e}",
+            fixture_path.display()
+        ))
+    })?;
+    let proposal: OntologyChangeProposal = serde_json::from_str(&raw)
+        .map_err(|e| UiError::internal(format!("parse fixture: {e}")))?;
+
+    let dir = state.generated_root.join(&proposal.id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| UiError::internal(format!("mkdir {}: {e}", dir.display())))?;
+    std::fs::write(dir.join("proposal.json"), &raw)
+        .map_err(|e| UiError::internal(format!("persist risky proposal: {e}")))?;
+
+    let report = check::check(&proposal, state.catalog.as_slice(), state.pool.as_ref())
+        .await
+        .map_err(|e| UiError::internal(format!("check::check failed: {e}")))?;
+
+    if let Ok(bytes) = serde_json::to_vec_pretty(&report) {
+        let _ = std::fs::write(dir.join("check_report.json"), bytes);
+    }
+
+    Ok(html! {
+        (check_report_panel(&report, &proposal.id, true))
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteForm {
+    pub provider: String,
+}
+
+pub async fn ui_write(
+    State(state): State<AppState>,
+    Form(form): Form<WriteForm>,
+) -> Result<Markup, UiError> {
+    let pool = state.require_pool()?;
+    let provider = form.provider.trim();
+    if provider.is_empty() {
+        return Err(UiError::bad_request("provider is required"));
+    }
+
+    let entity_id = format!("bi_demo_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let cmd = CreateBankIntegrationCmd {
+        entity_id: entity_id.clone(),
+        provider: provider.to_string(),
+    };
+
+    let outcome = entity_write::apply_create_bank_integration(
+        pool,
+        &cmd,
+        2,
+        WriteOrigin::HttpHandler,
+    )
+    .await
+    .map_err(|e| UiError::internal(format!("write failed: {e}")))?;
+
+    Ok(write_panel(&outcome))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TamperForm {
+    pub entity_id: String,
+}
+
+pub async fn ui_tamper(
+    State(state): State<AppState>,
+    Form(form): Form<TamperForm>,
+) -> Result<Markup, UiError> {
+    let pool = state.require_pool()?;
+    let entity_id = form.entity_id.trim();
+    if entity_id.is_empty() {
+        return Err(UiError::bad_request("entity_id is required"));
+    }
+
+    // ============================================================
+    // DEMO-ONLY: this path issues a raw SQL UPDATE that intentionally
+    // bypasses entity_write (and therefore the mutation_log). It exists
+    // so Beat 7 can show that even an out-of-band mutation is caught
+    // by `agora verify`. NEVER EXPOSE THIS HANDLER OUTSIDE OF THE DEMO.
+    // ============================================================
+    let new_provider = "evil_corp_tampered";
+    let res = sqlx::query("UPDATE bank_integrations SET provider = $1 WHERE id = $2")
+        .bind(new_provider)
+        .bind(entity_id)
+        .execute(pool)
+        .await
+        .map_err(|e| UiError::internal(format!("tamper SQL failed: {e}")))?;
+
+    if res.rows_affected() == 0 {
+        return Err(UiError::bad_request(format!(
+            "no bank_integrations row with id={entity_id:?}; write one first"
+        )));
+    }
+
+    Ok(tamper_panel(entity_id, new_provider))
+}
+
+pub async fn ui_verify(
+    State(state): State<AppState>,
+) -> Result<Markup, UiError> {
+    let pool = state.require_pool()?;
+    let report = verify::verify(pool)
+        .await
+        .map_err(|e| UiError::internal(format!("verify failed: {e}")))?;
+    Ok(verify_panel(&report))
+}
+
+// ============================================================================
+// Markup helpers
+// ============================================================================
+
+fn page_layout(title: &str, body: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                title { (title) }
+                link rel="stylesheet" href="/static/agora.css";
+                script src=(HTMX_CDN) defer {}
+                script { (PreEscaped(TAB_SCRIPT)) }
+            }
+            body {
+                header.topbar {
+                    span.mark {}
+                    span.wordmark { "agora" }
+                    span.tagline { "Governed operational ontology — demo control plane" }
+                    nav.nav {
+                        a href="/" { "Home" }
+                        a href="/ui/concepts" { "Concepts" }
+                        a href="/health" { "Health" }
+                    }
+                }
+                main.container { (body) }
+                footer { "agora · feature-4-browser-demo-ui" }
+            }
+        }
+    }
+}
+
+fn intro_block() -> Markup {
+    html! {
+        div.beat {
+            h1 style="margin:0 0 6px; font-size:24px; letter-spacing:-0.01em;" {
+                "Eight beats. One control plane. Real data."
+            }
+            p style="color:var(--text-muted); margin:0; font-size:14px;" {
+                "Run each beat in order. Every artifact below is produced live by the same library functions that power the agorad daemon and the agora CLI — there is no demo-mode toggle."
+            }
+        }
+    }
+}
+
+fn beat_section(num: &str, title: &str, sub: &str, body: Markup) -> Markup {
+    html! {
+        section.beat {
+            div.beat-head {
+                span.beat-num { (num) }
+                h2.beat-title { (title) }
+            }
+            p.beat-sub { (sub) }
+            div.beat-body { (body) }
+        }
+    }
+}
+
+fn nav_back(href: &str, label: &str) -> Markup {
+    html! {
+        p style="margin:0 0 16px;" {
+            a href=(href) { (label) }
+        }
+    }
+}
+
+fn proposal_card(
+    proposal: &OntologyChangeProposal,
+    mode: &AuthorMode,
+    manifest: &artifacts::ArtifactManifest,
+    reuse_report: &ReuseReport,
+) -> Markup {
+    let tab_group = format!("artifacts-{}", proposal.id);
+    html! {
+        div.box.info style="margin-top:18px" {
+            span.strong { "Proposal received." }
+            div.body {
+                "Authored by " span.id { (proposal.provenance.author) }
+                " · target " span.id { (proposal.target().fqn()) }
+                " · intent: " (proposal.change_intent)
+            }
+        }
+        dl.kv {
+            dt { "Proposal ID" }
+            dd { span.id { (proposal.id) } }
+            dt { "Author mode" }
+            dd { (author_mode_pill(mode)) }
+            dt { "Compatibility (declared)" }
+            dd {
+                span.mono {
+                    "shape=" (format!("{:?}", proposal.compatibility.shape).to_lowercase())
+                    " · semantic=" (format!("{:?}", proposal.compatibility.semantic).to_lowercase())
+                    " · policy=" (format!("{:?}", proposal.compatibility.policy).to_lowercase())
+                }
+            }
+            dt { "Meaning before" }
+            dd { (proposal.semantic_contract.meaning_before) }
+            dt { "Meaning after" }
+            dd { (proposal.semantic_contract.meaning_after) }
+        }
+
+        h4 style="margin:18px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" { "Reuse detection (Beat 02)" }
+        (reuse_block(reuse_report))
+
+        h4 style="margin:18px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" { "Generated artifacts (Beat 04)" }
+        p.hint { "Four real files written under " code { (manifest.directory) } "." }
+        (artifact_tabs(&tab_group, manifest))
+
+        div.row.right style="margin-top:18px" {
+            button
+                hx-post=(format!("/ui/proposals/{}/check", proposal.id))
+                hx-target="#beat-3-slot"
+                hx-swap="innerHTML"
+                hx-disabled-elt="this"
+            { "Run multi-axis check →" }
+        }
+    }
+}
+
+fn reuse_block(report: &ReuseReport) -> Markup {
+    let class_label = format!("{:?}", report.class);
+    let class_pill = match class_label.as_str() {
+        "Duplicate" => "fail",
+        "Refinement" => "warn",
+        "Reuse" => "advisory",
+        _ => "muted",
+    };
+    html! {
+        div {
+            span class=(format!("pill {class_pill}")) { (class_label) }
+            span style="margin-left:10px; color:var(--text-muted); font-size:13px;" { (report.explanation) }
+        }
+        @if !report.top_hits.is_empty() {
+            table.checks {
+                thead { tr { th { "Existing concept" } th { "Layer" } th { "Score" } th { "Jaccard" } th { "Cosine" } } }
+                tbody {
+                    @for hit in &report.top_hits {
+                        tr {
+                            td.findings { span.id { (hit.fqn) } }
+                            td.source { (hit.layer) }
+                            td.elapsed { (format_score(hit.score)) }
+                            td.elapsed { (format_score(hit.jaccard)) }
+                            td.elapsed { (format_score(hit.cosine)) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn artifact_tabs(group: &str, manifest: &artifacts::ArtifactManifest) -> Markup {
+    let entries: Vec<(&str, &str, String)> = vec![
+        ("proto", ".proto", read_or_placeholder(&manifest.proto)),
+        ("ddl", ".sql", read_or_placeholder(&manifest.ddl)),
+        ("handler", "_handler.rs", read_or_placeholder(&manifest.handler)),
+        ("policy", ".fga.json", read_or_placeholder(&manifest.openfga)),
+    ];
+    html! {
+        div.tabs {
+            @for (i, (name, label, _)) in entries.iter().enumerate() {
+                button
+                    type="button"
+                    data-tab-trigger="1"
+                    data-tab-group=(group)
+                    data-tab-name=(*name)
+                    class=(if i == 0 { "tab active" } else { "tab" })
+                { (label) }
+            }
+        }
+        @for (i, (name, _, body)) in entries.iter().enumerate() {
+            div
+                data-tab-group=(group)
+                data-tab-name=(*name)
+                class=(if i == 0 { "tab-panel active" } else { "tab-panel" })
+            {
+                pre.code { code { (body) } }
+            }
+        }
+    }
+}
+
+fn check_report_panel(report: &CheckReport, proposal_id: &str, is_risky: bool) -> Markup {
+    let dc = &report.data_conformance;
+    let banner: Markup = if report.auto_approval_eligible {
+        html! { div.box.success { span.strong { "All axes clean — auto-approval eligible." }
+            div.body { "Total wall-clock " (report.elapsed_ms) " ms across " (report.checks.len()) " axes plus data-conformance." }
+        } }
+    } else {
+        let reason = report.block_reason.clone().unwrap_or_else(|| "one or more axes failed".into());
+        html! { div.box.error { span.strong { "Blocked." } " " (reason)
+            div.body {
+                @if dc.violations_found > 0 {
+                    "Data-conformance counted "
+                    span.strong { (dc.violations_found) }
+                    " row(s) that would violate the proposed constraint. The proposal is not eligible for auto-approval."
+                } @else {
+                    "Review the per-axis rows below for details."
+                }
+            }
+        } }
+    };
+
+    html! {
+        (banner)
+        table.checks {
+            thead {
+                tr {
+                    th { "Axis" }
+                    th { "Outcome" }
+                    th { "Findings" }
+                    th { "Source" }
+                    th { "Elapsed" }
+                }
+            }
+            tbody {
+                @for row in &report.checks {
+                    tr {
+                        td.axis { (axis_label(row.axis)) }
+                        td.outcome { (outcome_pill(row.outcome)) }
+                        td.findings { (row.findings) }
+                        td.source { (row.source) }
+                        td.elapsed { (row.elapsed_ms) " ms" }
+                    }
+                }
+                tr {
+                    td.axis { "data_conformance" }
+                    td.outcome { (outcome_pill(dc.outcome)) }
+                    td.findings { (data_conformance_findings(dc)) }
+                    td.source { (dc.source) }
+                    td.elapsed { (dc.query_time_ms) " ms" }
+                }
+            }
+        }
+
+        @if !dc.sample_violations.is_empty() {
+            (sample_violations_block(&dc.sample_violations, dc.query.as_deref()))
+        }
+
+        @if !is_risky {
+            div.row.right style="margin-top:18px" {
+                button
+                    hx-post=(format!("/ui/proposals/{proposal_id}/approve"))
+                    hx-target="#beat-5-slot"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="this"
+                { "Submit for approval →" }
+            }
+        }
+    }
+}
+
+fn data_conformance_findings(dc: &DataConformance) -> Markup {
+    if !dc.applicable {
+        return html! { "Not applicable to this change kind." };
+    }
+    if matches!(dc.outcome, Outcome::Skipped) {
+        return html! { "Skipped — " (dc.source) };
+    }
+    if dc.violations_found > 0 {
+        html! {
+            (dc.violations_found) " existing row(s) would violate the proposed constraint."
+        }
+    } else {
+        html! { "No existing rows violate the proposed constraint." }
+    }
+}
+
+fn sample_violations_block(samples: &[SampleViolation], query: Option<&str>) -> Markup {
+    html! {
+        div.box.warn style="margin-top:14px" {
+            span.strong { "Sample violations (capped at " (samples.len()) ")" }
+            table.data style="margin-top:8px" {
+                thead { tr { th { "entity_id" } th { "reason" } } }
+                tbody {
+                    @for s in samples {
+                        tr {
+                            td.findings { span.id { (s.entity_id) } }
+                            td.findings { (s.reason) }
+                        }
+                    }
+                }
+            }
+            @if let Some(q) = query {
+                p.hint style="margin-top:10px" { "Query that produced this count:" }
+                pre.code { code { (q) } }
+            }
+        }
+    }
+}
+
+fn approval_panel(report: &CheckReport) -> Markup {
+    if report.auto_approval_eligible {
+        html! {
+            div.box.success {
+                span.strong { "Auto-approved." }
+                div.body {
+                    "Every axis of " span.id { (report.proposal_id) }
+                    " came back clean. The proposal is published; the four artifacts go live; ontology version increments. No human touched it."
+                }
+            }
+            dl.kv {
+                dt { "status" } dd { span.pill.pass { "approved" } }
+                dt { "predicate" } dd { span.mono { "auto_approval::apply ⇒ all_axes_clean=true" } }
+                dt { "report id" } dd { span.id { (report.proposal_id) } }
+                dt { "generated_at" } dd { span.mono { (report.generated_at) } }
+            }
+        }
+    } else {
+        let reason = report.block_reason.clone().unwrap_or_else(|| "one or more axes failed".into());
+        html! {
+            div.box.error {
+                span.strong { "Blocked." }
+                div.body { (reason) }
+            }
+            dl.kv {
+                dt { "status" } dd { span.pill.fail { "blocked" } }
+                dt { "predicate" } dd { span.mono { "auto_approval::apply ⇒ all_axes_clean=false" } }
+                dt { "report id" } dd { span.id { (report.proposal_id) } }
+            }
+        }
+    }
+}
+
+fn write_panel(outcome: &WriteOutcome) -> Markup {
+    html! {
+        div.box.success {
+            span.strong { "Write committed." }
+            div.body {
+                "Row inserted into " span.id { (outcome.entity_type) }
+                " plus an atomic mutation_log entry."
+            }
+        }
+        dl.kv {
+            dt { "entity_id" } dd { span.id { (outcome.entity_id) } }
+            dt { "operation" } dd { span.mono { (outcome.operation) } }
+            dt { "ontology_version" } dd { span.mono { (outcome.ontology_version) } }
+            dt { "mutation_seq" } dd { span.mono { (outcome.mutation_seq) } }
+            dt { "checksum (SHA-256)" } dd { span.mono style="word-break:break-all" { (outcome.checksum) } }
+            dt { "actor" } dd { span.mono { (outcome.actor) } }
+        }
+        div.row style="margin-top:18px; gap:12px" {
+            form
+                hx-post="/ui/tamper"
+                hx-target="#beat-7b-slot"
+                hx-swap="innerHTML"
+                hx-disabled-elt="find button"
+            {
+                input type="hidden" name="entity_id" value=(outcome.entity_id) {}
+                button.danger type="submit" { "Tamper this row out-of-band →" }
+            }
+            button
+                class="secondary"
+                hx-get="/ui/verify"
+                hx-target="#beat-7c-slot"
+                hx-swap="innerHTML"
+                hx-disabled-elt="this"
+            { "Run agora verify" }
+        }
+        p.hint { "Tamper issues a raw SQL UPDATE that bypasses the handler entirely. Verify reproduces the canonical-JSON checksum from the live row and compares it to the logged one." }
+    }
+}
+
+fn tamper_panel(entity_id: &str, new_provider: &str) -> Markup {
+    html! {
+        div.box.warn {
+            span.strong { "Out-of-band UPDATE issued." }
+            div.body {
+                "Row " span.id { (entity_id) } " had its " code { "provider" }
+                " column changed to " code { (new_provider) }
+                " via raw SQL — the mutation_log was NOT updated. The control plane no longer agrees with the database."
+            }
+        }
+        pre.code style="margin-top:10px" { code {
+            "UPDATE bank_integrations SET provider = '" (new_provider) "' WHERE id = '" (entity_id) "';"
+        } }
+        div.row.right style="margin-top:14px" {
+            button
+                hx-get="/ui/verify"
+                hx-target="#beat-7c-slot"
+                hx-swap="innerHTML"
+                hx-disabled-elt="this"
+            { "Run agora verify →" }
+        }
+    }
+}
+
+fn verify_panel(report: &VerifyReport) -> Markup {
+    let ok = matches!(report.verify_status, VerifyStatus::Clean);
+    let banner = if ok {
+        html! { div.box.success { span.strong { "Clean." }
+            div.body { "Checked " (report.entities_checked) " entities in " (report.elapsed_ms) " ms. No drift." }
+        } }
+    } else {
+        let drift_n = report.tampered_entities.len();
+        let oob_n = report.outofband_entities.len();
+        html! { div.box.error { span.strong { "Drift detected." }
+            div.body {
+                (drift_n) " tampered row(s) and " (oob_n) " out-of-band row(s) across " (report.entities_checked) " entities. The control plane caught what raw SQL changed."
+            }
+        } }
+    };
+    html! {
+        (banner)
+        @if !report.tampered_entities.is_empty() {
+            h4 style="margin:14px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" { "Tampered rows" }
+            table.data {
+                thead { tr { th { "type" } th { "entity_id" } th { "fields changed" } th { "last_seq" } th { "logged actor" } th { "checksum (live ≠ logged)" } } }
+                tbody {
+                    @for d in &report.tampered_entities {
+                        tr {
+                            td.findings { span.id { (d.entity_type) } }
+                            td.findings { span.id { (d.entity_id) } }
+                            td.findings { (d.fields_changed.join(", ")) }
+                            td.elapsed { (d.last_logged_mutation_seq) }
+                            td.findings { span.mono { (d.last_logged_actor) } }
+                            td.findings { span.mono style="word-break:break-all" {
+                                (truncate_checksum(d.logged_checksum.as_deref())) " ≠ " (truncate_checksum(Some(&d.current_checksum)))
+                            } }
+                        }
+                    }
+                }
+            }
+        }
+        @if !report.outofband_entities.is_empty() {
+            h4 style="margin:14px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" { "Created out-of-band" }
+            table.data {
+                thead { tr { th { "type" } th { "entity_id" } th { "issue" } th { "current checksum" } } }
+                tbody {
+                    @for o in &report.outofband_entities {
+                        tr {
+                            td.findings { span.id { (o.entity_type) } }
+                            td.findings { span.id { (o.entity_id) } }
+                            td.findings { (o.issue) }
+                            td.findings { span.mono style="word-break:break-all" { (truncate_checksum(Some(&o.current_checksum))) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn concept_view_markup(view: &ConceptView, has_db: bool) -> Markup {
+    html! {
+        div.beat {
+            div.beat-head {
+                span.beat-num { "08" }
+                h2.beat-title { (view.fqn) }
+            }
+            p.beat-sub { (view.doc.clone().unwrap_or_else(|| "—".into())) }
+
+            dl.kv {
+                dt { "namespace" } dd { span.mono { (view.namespace) } }
+                dt { "name" } dd { span.mono { (view.name) } }
+                dt { "version" } dd { span.mono { (view.version) " (" (view.status) ")" } }
+                dt { "owner" } dd {
+                    span.mono { (view.ownership.team) }
+                    @if let Some(s) = &view.ownership.semantic_steward {
+                        " · semantic steward: " span.mono { (s) }
+                    }
+                }
+                dt { "policy class" } dd { span.pill.muted { (format!("{:?}", view.policy_class)) } }
+            }
+        }
+
+        div.beat {
+            div.explorer-section {
+                h3 { "Fields" }
+                table.data {
+                    thead { tr { th { "name" } th { "type" } th { "required" } th { "since" } th { "classification" } th { "doc" } } }
+                    tbody {
+                        @for f in &view.fields {
+                            tr {
+                                td.findings { span.mono { (f.name) } }
+                                td.findings { span.mono { (f.proto_type) } }
+                                td.findings { @if f.required { "✓" } @else { "—" } }
+                                td.elapsed { "v" (f.since_version) }
+                                td.findings { span.pill.muted { (format!("{:?}", f.classification)) } }
+                                td.findings { (f.doc.clone().unwrap_or_default()) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            div.explorer-section {
+                h3 { "Invariants" }
+                @if view.invariants.is_empty() {
+                    p.hint { "None declared." }
+                } @else {
+                    ul.invariants {
+                        @for inv in &view.invariants { li { (inv) } }
+                    }
+                }
+            }
+
+            div.explorer-section {
+                h3 { "Lineage" }
+                dl.kv {
+                    dt { "HTTP route" } dd { span.mono { (view.lineage.http_route) } }
+                    dt { "storage table" } dd { span.mono { (view.lineage.storage_table) } }
+                    dt { "proto" } dd { span.mono { (view.lineage.proto_artifact) } }
+                    dt { "policy spec" } dd { span.mono { (view.lineage.policy_artifact) } }
+                }
+                @if !view.lineage.references.is_empty() {
+                    h4 style="margin:12px 0 4px; font-size:12px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.05em;" { "References" }
+                    ul.references {
+                        @for r in &view.lineage.references { li { span.mono { (r) } } }
+                    }
+                }
+                @if !view.lineage.touched_by_proposals.is_empty() {
+                    h4 style="margin:12px 0 4px; font-size:12px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.05em;" { "Touched by proposals" }
+                    ul.touched {
+                        @for p in &view.lineage.touched_by_proposals { li { span.id { (p) } } }
+                    }
+                }
+            }
+
+            div.explorer-section {
+                h3 { "Policy attachments" }
+                @if view.policy_examples.is_empty() {
+                    p.hint { "Public — no per-relation tuples." }
+                } @else {
+                    table.data {
+                        thead { tr { th { "relation" } th { "subject" } th { "object" } } }
+                        tbody {
+                            @for p in &view.policy_examples {
+                                tr {
+                                    td.findings { span.mono { (p.relation) } }
+                                    td.findings { span.mono { (p.subject) } }
+                                    td.findings { span.mono { (p.object) } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            div.explorer-section {
+                h3 { "Version history" }
+                @if !has_db {
+                    div.box.warn {
+                        span.strong { "DB unavailable." }
+                        div.body { "Version history is read live from mutation_log; agorad has no DATABASE_URL set." }
+                    }
+                } @else if view.version_history.is_empty() {
+                    p.hint { "No mutations recorded for this type yet." }
+                } @else {
+                    table.history {
+                        thead { tr { th { "seq" } th { "operation" } th { "ontology_v" } th { "entity_id" } th { "actor" } th { "occurred_at (UTC)" } th { "checksum" } } }
+                        tbody {
+                            @for h in &view.version_history {
+                                tr {
+                                    td { (h.mutation_seq) }
+                                    td { (h.operation) }
+                                    td { "v" (h.ontology_version) }
+                                    td { (h.entity_id) }
+                                    td { (h.actor) }
+                                    td { (h.occurred_at.to_rfc3339()) }
+                                    td { (truncate_checksum(h.checksum.as_deref())) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Small utilities
+// ============================================================================
+
+fn outcome_pill(o: Outcome) -> Markup {
+    let (cls, label) = match o {
+        Outcome::Pass => ("pass", "pass"),
+        Outcome::Advisory => ("advisory", "advisory"),
+        Outcome::Fail => ("fail", "fail"),
+        Outcome::Skipped => ("skipped", "skipped"),
+    };
+    html! { span class=(format!("pill {cls}")) { (label) } }
+}
+
+fn author_mode_pill(mode: &AuthorMode) -> Markup {
+    match mode {
+        AuthorMode::Live => html! { span.pill.live { "live · LLM-derived" } },
+        AuthorMode::OfflineNoKey => html! { span.pill.offline { "offline · no API key" } },
+        AuthorMode::OfflineApiError { error } => {
+            html! { span.pill.offline title=(error) { "offline · API error" } }
+        }
+    }
+}
+
+fn axis_label(a: Axis) -> &'static str {
+    a.as_str()
+}
+
+fn format_score(f: f32) -> String {
+    format!("{:.2}", f)
+}
+
+fn truncate_checksum(c: Option<&str>) -> String {
+    match c {
+        Some(s) if s.len() > 12 => format!("{}…", &s[..12]),
+        Some(s) => s.to_string(),
+        None => "—".into(),
+    }
+}
+
+fn read_or_placeholder(path: &str) -> String {
+    match std::fs::read_to_string(PathBuf::from(path)) {
+        Ok(s) => s,
+        Err(e) => format!("// could not read {path}: {e}"),
+    }
+}
+
+fn load_proposal(path: &Path) -> Result<OntologyChangeProposal> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parsing proposal JSON at {}", path.display()))
+}
+
+// ============================================================================
+// Error handling — UI variant: returns HTML, not JSON.
+// ============================================================================
+
+#[derive(Debug)]
+pub struct UiError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl UiError {
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self { status: StatusCode::BAD_REQUEST, message: msg.into() }
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self { status: StatusCode::NOT_FOUND, message: msg.into() }
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        let m = msg.into();
+        tracing::error!("ui error: {m}");
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: m }
+    }
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self { status: StatusCode::SERVICE_UNAVAILABLE, message: msg.into() }
+    }
+}
+
+impl IntoResponse for UiError {
+    fn into_response(self) -> Response {
+        let body = html! {
+            div.box.error {
+                span.strong { "Error " (self.status.as_u16()) "." }
+                div.body { (self.message) }
+            }
+        };
+        (self.status, body).into_response()
+    }
+}
+
+// Internal helper exposed to the UI module for require_pool. The daemon's
+// `require_db` uses a JSON-formatted ApiError, so we redefine the predicate
+// here producing a UiError instead.
+trait AppStateUi {
+    fn require_pool(&self) -> Result<&PgPool, UiError>;
+}
+
+impl AppStateUi for AppState {
+    fn require_pool(&self) -> Result<&PgPool, UiError> {
+        self.pool.as_ref().ok_or_else(|| {
+            UiError::service_unavailable(
+                "agorad has no Postgres connection (set DATABASE_URL on launch)",
+            )
+        })
+    }
+}

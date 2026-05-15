@@ -34,3 +34,4 @@ pub mod verify;
 pub mod explorer;
 
 pub mod daemon;
+pub mod ui;
