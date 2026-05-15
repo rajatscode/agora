@@ -415,6 +415,10 @@ struct WriteEntityReq {
     provider: Option<String>,
     #[serde(default = "default_ontology_version")]
     ontology_version: i32,
+    /// F5: optional actor — defaults to the owner team so legacy clients
+    /// (e.g. existing daemon_http.rs test) keep working without changes.
+    #[serde(default)]
+    actor: Option<String>,
 }
 
 fn default_ontology_version() -> i32 {
@@ -458,14 +462,37 @@ async fn write_entity(
             entity_id: req.entity_id,
             provider,
         };
-        let outcome = entity_write::apply_create_bank_integration(
+
+        // F5: resolve actor. Default to the owning team so existing tests
+        // (and any client that hasn't been updated yet) keep getting Allow.
+        let actor = req
+            .actor
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("team:integrations-platform");
+        // Find the policy card for BankIntegration in the catalog. Always
+        // present in the seed catalog; if not, the policy check is skipped
+        // (None) and we keep historical behaviour.
+        let policy_card = state
+            .catalog
+            .iter()
+            .find(|c| c.fqn == TYPE_BANK_INTEGRATION);
+
+        let outcome = entity_write::apply_create_bank_integration_authzed(
             pool,
             &cmd,
             req.ontology_version,
             WriteOrigin::HttpHandler,
+            actor,
+            policy_card,
         )
         .await
-        .map_err(|e| ApiError::internal("write_failed", e))?;
+        .map_err(|e| match e {
+            entity_write::WriteError::PolicyDenied(denial) => {
+                ApiError::policy_denied(denial)
+            }
+            entity_write::WriteError::Other(err) => ApiError::internal("write_failed", err),
+        })?;
         return Ok(Json(outcome));
     }
 
@@ -593,28 +620,80 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     details: String,
+    /// F5: optional structured policy-denial trace. When present, the JSON
+    /// body adds an `evidence` field carrying the actor / relation / object /
+    /// considered-tuples so the UI can render the full denial story.
+    policy_evidence: Option<serde_json::Value>,
 }
 
 impl ApiError {
     pub fn bad_request(code: &'static str, details: impl Into<String>) -> Self {
-        Self { status: StatusCode::BAD_REQUEST, code, details: details.into() }
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            details: details.into(),
+            policy_evidence: None,
+        }
     }
     pub fn not_found(code: &'static str, details: impl Into<String>) -> Self {
-        Self { status: StatusCode::NOT_FOUND, code, details: details.into() }
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+            details: details.into(),
+            policy_evidence: None,
+        }
     }
     pub fn service_unavailable(code: &'static str, details: impl Into<String>) -> Self {
-        Self { status: StatusCode::SERVICE_UNAVAILABLE, code, details: details.into() }
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            details: details.into(),
+            policy_evidence: None,
+        }
     }
     pub fn internal(code: &'static str, err: impl std::fmt::Display) -> Self {
         let details = err.to_string();
         tracing::error!(error_code = code, %details, "agorad internal error");
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, code, details }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            details,
+            policy_evidence: None,
+        }
+    }
+
+    /// F5: 403 with the full denial trace from the policy evaluator. The
+    /// mutation_log seq is included so the client / UI can deep-link to the
+    /// audit row.
+    pub fn policy_denied(denial: entity_write::PolicyDeniedError) -> Self {
+        let evidence = json!({
+            "actor":          denial.actor,
+            "relation":       denial.relation,
+            "object":         denial.object,
+            "reason":         denial.reason,
+            "considered":     denial.considered,
+            "logged_seq":     denial.logged_seq,
+            "operation_logged": "DenyAttempt",
+        });
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "policy_denied",
+            details: denial.reason,
+            policy_evidence: Some(evidence),
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "error": self.code, "details": self.details });
+        let body = match self.policy_evidence {
+            Some(ev) => json!({
+                "error":    self.code,
+                "details":  self.details,
+                "evidence": ev,
+            }),
+            None => json!({ "error": self.code, "details": self.details }),
+        };
         (self.status, Json(body)).into_response()
     }
 }

@@ -43,6 +43,10 @@ use sqlx::{PgPool, Postgres, Transaction};
 pub const OP_CREATE: &str = "Create";
 pub const OP_UPDATE: &str = "Update";
 pub const OP_DELETE: &str = "Delete";
+/// F5: a denial attempt — the actor tried to write but policy blocked them.
+/// The entity row is NOT inserted; only the mutation_log row is, so the
+/// audit trail captures who tried, when, and why they were refused.
+pub const OP_DENY_ATTEMPT: &str = "DenyAttempt";
 
 /// Author identity for writes that came through Agora's HTTP handler / CLI.
 /// Drift attribution: anything *not* in mutation_log is, by elimination,
@@ -156,11 +160,39 @@ pub async fn log_mutation_in_tx(
     ontology_version: i32,
     actor: &str,
 ) -> Result<MutationRecord> {
+    log_mutation_with_denial_in_tx(
+        tx,
+        type_id,
+        entity_id,
+        operation,
+        data,
+        ontology_version,
+        actor,
+        None,
+    )
+    .await
+}
+
+/// F5 variant: log a mutation row with an optional `denial_reason`. For
+/// allowed writes the reason is `None` and behaves identically to the
+/// historical signature. For denied attempts the reason is `Some(text)`,
+/// and the row carries a deterministic checksum over the attempted
+/// payload — so the audit log is still tamper-evident.
+pub async fn log_mutation_with_denial_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    type_id: &str,
+    entity_id: &str,
+    operation: &str,
+    data: &Value,
+    ontology_version: i32,
+    actor: &str,
+    denial_reason: Option<&str>,
+) -> Result<MutationRecord> {
     let checksum = compute_checksum(type_id, entity_id, operation, data, ontology_version);
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO mutation_log
-            (type_id, ontology_version, entity_id, command, payload, actor, checksum)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (type_id, ontology_version, entity_id, command, payload, actor, checksum, denial_reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING seq",
     )
     .bind(type_id)
@@ -170,6 +202,7 @@ pub async fn log_mutation_in_tx(
     .bind(data)
     .bind(actor)
     .bind(&checksum)
+    .bind(denial_reason)
     .fetch_one(&mut **tx)
     .await
     .context("inserting into mutation_log")?;

@@ -18,6 +18,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_seed_accounts.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_mutation_log_checksum.sql");
+const MIGRATION_004: &str = include_str!("../migrations/004_policy_denial.sql");
 
 /// Connect to Postgres. Returns Ok(None) if DATABASE_URL is unset OR the
 /// connection attempt fails — caller is expected to fall back to a
@@ -63,5 +64,9 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("running migrations/003_mutation_log_checksum.sql")?;
+    sqlx::raw_sql(MIGRATION_004)
+        .execute(pool)
+        .await
+        .context("running migrations/004_policy_denial.sql")?;
     Ok(())
 }

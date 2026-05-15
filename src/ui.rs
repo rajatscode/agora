@@ -210,8 +210,8 @@ pub async fn home() -> Markup {
 
         (beat_section(
             "07",
-            "Write → tamper → verify",
-            "A controlled write creates a BankIntegration row and a mutation_log entry inside one transaction. Then we issue a raw SQL UPDATE that bypasses the handler. Then agora verify reproduces the canonical-JSON checksum and surfaces the drift.",
+            "Write → policy → tamper → verify",
+            "A controlled write creates a BankIntegration row and a mutation_log entry inside one transaction — but only after the FGA policy evaluator clears the actor on the `owner` relation. Pick `team:integrations-platform` to see the allow path; pick `team:marketing` to see the deny path with full policy trace. Both attempts are logged: the denial gets its own DenyAttempt row so it's auditable.",
             html! {
                 form
                     hx-post="/ui/write"
@@ -220,11 +220,18 @@ pub async fn home() -> Markup {
                     hx-disabled-elt="find button"
                 {
                     div.row {
+                        label for="actor" { "Actor " }
+                        select name="actor" style="max-width:280px" {
+                            option value="team:integrations-platform" selected { "team:integrations-platform (owner — allow)" }
+                            option value="team:marketing" { "team:marketing (not owner — deny)" }
+                        }
+                    }
+                    div.row {
                         label for="provider" { "Provider " }
                         input type="text" name="provider" value="plaid" style="max-width:200px" {}
                         button type="submit" { "Write a BankIntegration →" }
                     }
-                    p.hint { "The entity_id is generated server-side. The response carries " code { "mutation_seq" } " and the SHA-256 checksum that was logged." }
+                    p.hint { "The entity_id is generated server-side. The policy evaluator runs " code { "policy::evaluate(...)" } " against the FGA spec for the concept; on allow the response carries " code { "mutation_seq" } " and the SHA-256 checksum, on deny the response carries the full denial trace and the DenyAttempt row's seq." }
                 }
                 div id="beat-7a-slot" {}
                 div id="beat-7b-slot" {}
@@ -480,6 +487,12 @@ pub async fn ui_agent_run(
 #[derive(Debug, Deserialize)]
 pub struct WriteForm {
     pub provider: String,
+    /// F5: actor performing the write. The form ships a dropdown with two
+    /// options — `team:integrations-platform` (owner, allowed) and
+    /// `team:marketing` (denied). An unrecognised value still gets policy-
+    /// checked; we don't try to canonicalise here.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 pub async fn ui_write(
@@ -498,16 +511,34 @@ pub async fn ui_write(
         provider: provider.to_string(),
     };
 
-    let outcome = entity_write::apply_create_bank_integration(
+    // F5: resolve actor + policy card; render allow OR deny panel.
+    let actor = form
+        .actor
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("team:integrations-platform");
+    let policy_card = state
+        .catalog
+        .iter()
+        .find(|c| c.fqn == entity_write::TYPE_BANK_INTEGRATION);
+
+    match entity_write::apply_create_bank_integration_authzed(
         pool,
         &cmd,
         2,
         WriteOrigin::HttpHandler,
+        actor,
+        policy_card,
     )
     .await
-    .map_err(|e| UiError::internal(format!("write failed: {e}")))?;
-
-    Ok(write_panel(&outcome))
+    {
+        Ok(outcome) => Ok(write_panel_with_actor(&outcome, actor)),
+        Err(entity_write::WriteError::PolicyDenied(denial)) => Ok(deny_panel(&denial)),
+        Err(entity_write::WriteError::Other(e)) => {
+            Err(UiError::internal(format!("write failed: {e}")))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1004,6 +1035,74 @@ fn attempt_card(attempt: &Attempt) -> Markup {
                     "Gate blocked. The revision step gets this full report (block_reason + per-axis evidence) as input."
                 }
             }
+        }
+    }
+}
+
+/// F5: write_panel + a small allow trace showing which policy tuple matched.
+/// `actor` is what the form selected — used for the trace line. The
+/// underlying mutation_log row already records the actor on `outcome`.
+fn write_panel_with_actor(outcome: &WriteOutcome, actor: &str) -> Markup {
+    html! {
+        div.box.success {
+            span.strong { "Allowed by policy → write committed." }
+            div.body {
+                "Actor " span.id { (actor) } " holds the "
+                code { "owner" }
+                " relation on " span.id { (outcome.entity_type) } "."
+            }
+        }
+        dl.kv {
+            dt { "policy decision" } dd { span.pill.pass { "allow" } }
+            dt { "actor" } dd { span.mono { (actor) } }
+            dt { "relation" } dd { span.mono { "owner" } }
+            dt { "object" } dd { span.mono { "bank_integration:" (outcome.entity_id) } }
+        }
+        (write_panel(outcome))
+    }
+}
+
+/// F5: deny panel. Red box + full policy trace + DenyAttempt seq so the
+/// audience can see *who* tried, *what* policy rejected them, and *where*
+/// in the audit log the denial lives. No tamper / verify buttons here —
+/// nothing was written to the entity table; only the denial row exists.
+fn deny_panel(denial: &entity_write::PolicyDeniedError) -> Markup {
+    html! {
+        div.box.error {
+            span.strong { "Policy denied → write refused." }
+            div.body { (denial.reason) }
+        }
+        dl.kv {
+            dt { "policy decision" } dd { span.pill.fail { "deny" } }
+            dt { "actor" } dd { span.mono { (denial.actor) } }
+            dt { "relation" } dd { span.mono { (denial.relation) } }
+            dt { "object" } dd { span.mono { (denial.object) } }
+            @if let Some(seq) = denial.logged_seq {
+                dt { "denial logged at seq" } dd { span.mono { (seq) } " (operation = " code { "DenyAttempt" } ", denial_reason persisted)" }
+            }
+        }
+        @if !denial.considered.is_empty() {
+            h4 style="margin:14px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" { "Tuples considered" }
+            table.checks {
+                thead { tr { th { "object" } th { "relation" } th { "user" } th { "outcome" } } }
+                tbody {
+                    @for t in &denial.considered {
+                        tr {
+                            td.findings { span.mono { (t.object) } }
+                            td.findings { span.mono { (t.relation) } }
+                            td.findings { span.mono { (t.user) } }
+                            td.outcome {
+                                @if t.user == denial.actor { span.pill.pass { "match user" } }
+                                @else { span.pill.fail { "user mismatch" } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        p.hint style="margin-top:12px" {
+            "Nothing was written to " code { "bank_integrations" } " — the policy check fires before the txn. "
+            "The denial itself IS in " code { "mutation_log" } " (operation = " code { "DenyAttempt" } ") so the audit trail captures the attempt, the actor, and the rejection reason verbatim. Beat 7's verify will NOT flag this as drift; no entity row exists."
         }
     }
 }
