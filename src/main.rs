@@ -8,11 +8,14 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Route ALL tracing output to stderr so `--json` stdout remains
+    // a clean, machine-parseable JSON document.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .with_target(false)
         .compact()
         .init();

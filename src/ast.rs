@@ -158,6 +158,12 @@ pub struct SemanticContract {
     /// Free-text explanation of WHY this preserves (or changes) meaning.
     #[serde(default)]
     pub justification: Option<String>,
+    /// Invariants the proposal commits to upholding once the change ships.
+    /// E.g. "Every active BankIntegration has at least one supported AuthenticationMethod".
+    /// The risk-gate workstream evaluates these via the LLM-axis check.
+    /// Heuristic author MUST populate at least two; LLM author SHOULD populate two-plus.
+    #[serde(default)]
+    pub invariants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

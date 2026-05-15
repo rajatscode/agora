@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::ast::{
     Change, CompatibilityClass, CompatibilityDeclaration, Field, OntologyChangeProposal,
-    Ownership, PolicyClass, ProposalTest, ProtoType, Provenance, Relation, SemanticContract,
+    OntologyType, Ownership, PolicyClass, ProposalTest, ProtoType, Provenance, SemanticContract,
     TypeRef,
 };
 
@@ -158,6 +158,10 @@ Hard rules:
 4. Be honest about `compatibility`: an additive optional field is `additive` \
    on shape, semantic, temporal, and storage axes; reclassifying PII upward is \
    `refinement` on policy; widening read scope is `dangerous` on policy.
+4b. `semantic_contract.invariants` MUST contain at least two human-readable \
+   invariants the change commits to (one about the new field/relation, one \
+   about the relationship to the parent concept). The risk gate evaluates \
+   these.
 5. Prefer existing namespaces (`core.integrations`, `core.users`, \
    `core.payments`) — do NOT invent new top-level domains casually.
 6. `ownership.team` should be a real team slug (`integrations-platform`, \
@@ -201,11 +205,17 @@ fn proposal_input_schema() -> Value {
             },
             "semantic_contract": {
                 "type": "object",
-                "required": ["meaning_before", "meaning_after"],
+                "required": ["meaning_before", "meaning_after", "invariants"],
                 "properties": {
                     "meaning_before": { "type": "string" },
                     "meaning_after":  { "type": "string" },
-                    "justification":  { "type": "string" }
+                    "justification":  { "type": "string" },
+                    "invariants": {
+                        "type": "array",
+                        "minItems": 2,
+                        "description": "At least two human-readable invariants the change commits to (e.g. 'Every active BankIntegration has ≥1 supported AuthenticationMethod').",
+                        "items": { "type": "string" }
+                    }
                 }
             },
             "compatibility": {
@@ -325,9 +335,16 @@ fn proposal_input_schema() -> Value {
 // ----- offline fallback -----
 
 /// Heuristic author so the CLI works without an API key (and so unit tests
-/// don't pay for tokens). Looks at keywords in the prompt to pick a
-/// best-effort proposal shape. Not clever — it doesn't have to be: as soon
-/// as `ANTHROPIC_API_KEY` is set the real model takes over.
+/// don't pay for tokens). Routes prompts through one of three buckets:
+///   - matches an existing concept   → AddField on that concept (Refinement)
+///   - matches "user/customer"       → AddField on `core.users.User`
+///   - matches NOTHING in the catalog → CreateType under a fresh namespace
+///                                      derived from the prompt (New)
+///
+/// The third bucket is what makes "cosmic ray sensors" classify as `New`
+/// rather than getting force-fit onto BankIntegration.
+///
+/// As soon as `ANTHROPIC_API_KEY` is set the real model takes over.
 pub fn mock_proposal_from_prompt(
     prompt: &str,
     actor: &str,
@@ -345,44 +362,60 @@ pub fn mock_proposal_from_prompt(
     let mentions_bank = lower.contains("bank") || lower.contains("integration");
     let mentions_user = lower.contains("user") || lower.contains("customer");
 
-    let (namespace, type_name, field_name, classification, summary) =
-        if mentions_biometric || (mentions_login && mentions_bank) {
-            (
-                "core.integrations",
-                "AuthenticationMethod",
-                if mentions_biometric { "biometric_enrolled" } else { "supports_oauth" },
-                PolicyClass::Internal,
-                "Add a new authentication-method capability flag to BankIntegration.",
-            )
-        } else if mentions_user {
-            (
-                "core.users",
-                "User",
-                "preferred_login_method",
-                PolicyClass::Internal,
-                "Track which login method a user prefers.",
-            )
-        } else {
-            (
-                "core.integrations",
-                "BankIntegration",
-                "feature_flag",
-                PolicyClass::Internal,
-                "Generic feature-flag field on BankIntegration.",
-            )
-        };
+    if mentions_biometric || (mentions_login && mentions_bank) {
+        return author_add_field_on(
+            "core.integrations",
+            "AuthenticationMethod",
+            if mentions_biometric { "biometric_enrolled" } else { "supports_oauth" },
+            PolicyClass::Internal,
+            "Add a new authentication-method capability flag to BankIntegration.",
+            "integrations-platform",
+            prompt,
+            actor,
+            proposal_id,
+        );
+    }
+    if mentions_user {
+        return author_add_field_on(
+            "core.users",
+            "User",
+            "preferred_login_method",
+            PolicyClass::Internal,
+            "Track which login method a user prefers.",
+            "identity-platform",
+            prompt,
+            actor,
+            proposal_id,
+        );
+    }
+    // Nothing matched → propose a brand-new type. This makes novel prompts
+    // ("cosmic ray sensors", "telemetry probes", etc.) classify as `New`
+    // by both the classifier (no exact-match in catalog) AND the spec
+    // (the change kind is CreateType).
+    author_create_type_from(prompt, actor, proposal_id)
+}
 
+fn author_add_field_on(
+    namespace: &str,
+    type_name: &str,
+    field_name: &str,
+    classification: PolicyClass,
+    summary: &str,
+    team: &str,
+    prompt: &str,
+    actor: &str,
+    proposal_id: String,
+) -> OntologyChangeProposal {
     let target = TypeRef {
         namespace: namespace.to_string(),
         name: type_name.to_string(),
     };
-
     let change = Change::AddField {
         type_ref: target.clone(),
         field: Field {
             name: field_name.to_string(),
             proto_type: ProtoType::Bool,
-            proto_number: 17, // arbitrary unused number; compiler workstream renumbers.
+            proto_number: 17,
             required: false,
             since_version: 2,
             deprecated_in: None,
@@ -391,24 +424,12 @@ pub fn mock_proposal_from_prompt(
         },
     };
 
-    let _ = Relation {
-        name: "_".into(),
-        from: target.clone(),
-        to: target.clone(),
-        cardinality: crate::ast::Cardinality::OneToOne,
-        since_version: 1,
-    };
-
     OntologyChangeProposal {
         id: proposal_id,
         domain: namespace.split('.').nth(1).unwrap_or("misc").to_string(),
         namespace: namespace.to_string(),
         change_intent: summary.to_string(),
-        rationale: format!(
-            "Heuristic author: original request was: \"{}\". Selected an additive \
-             boolean field on `{}.{}` because the request reads as a capability flag.",
-            prompt, namespace, type_name
-        ),
+        rationale: rationale_for_addfield(prompt, namespace, type_name, field_name),
         change,
         semantic_contract: SemanticContract {
             meaning_before: format!("`{}.{}` did not record this capability.", namespace, type_name),
@@ -417,10 +438,13 @@ pub fn mock_proposal_from_prompt(
                 namespace, type_name, field_name
             ),
             justification: Some(
-                "Field is additive and optional, defaulting to false; existing readers \
-                 see no behavioural change."
+                "Field is additive and optional; existing readers see no behavioural change."
                     .into(),
             ),
+            invariants: vec![
+                format!("If `{}` is true on a `{}`, the underlying provider must support it (validated downstream).", field_name, type_name),
+                format!("Setting `{}` does not change the visibility class of `{}.{}`.", field_name, namespace, type_name),
+            ],
         },
         compatibility: CompatibilityDeclaration {
             shape: CompatibilityClass::Additive,
@@ -431,21 +455,14 @@ pub fn mock_proposal_from_prompt(
             storage: CompatibilityClass::Additive,
         },
         ownership: Ownership {
-            team: if namespace.starts_with("core.users") {
-                "identity-platform".into()
-            } else {
-                "integrations-platform".into()
-            },
+            team: team.to_string(),
             semantic_steward: Some("core-ontology".into()),
         },
         tests: vec![
             ProposalTest {
                 name: "field_default_false".into(),
                 kind: "smoke".into(),
-                assertion: format!(
-                    "After migration, all existing rows have `{}` = false.",
-                    field_name
-                ),
+                assertion: format!("After migration, all existing rows have `{}` = false.", field_name),
             },
             ProposalTest {
                 name: "additive_back_compat".into(),
@@ -461,4 +478,187 @@ pub fn mock_proposal_from_prompt(
             trace_id: None,
         },
     }
+}
+
+fn author_create_type_from(
+    prompt: &str,
+    actor: &str,
+    proposal_id: String,
+) -> OntologyChangeProposal {
+    let (domain, type_name) = pick_domain_and_type_name(prompt);
+    let namespace = format!("draft.{}", domain);
+    let team = format!("{}-platform", domain);
+
+    let new_type = OntologyType {
+        namespace: namespace.clone(),
+        name: type_name.clone(),
+        version: 1,
+        fields: vec![
+            Field {
+                name: "id".into(),
+                proto_type: ProtoType::String,
+                proto_number: 1,
+                required: true,
+                since_version: 1,
+                deprecated_in: None,
+                classification: PolicyClass::Internal,
+                doc: Some("Stable id".into()),
+            },
+            Field {
+                name: "created_at".into(),
+                proto_type: ProtoType::Timestamp,
+                proto_number: 2,
+                required: true,
+                since_version: 1,
+                deprecated_in: None,
+                classification: PolicyClass::Internal,
+                doc: Some("Wall-clock time the entity was created.".into()),
+            },
+        ],
+        relations: vec![],
+        invariants: vec![
+            format!("`{}.{}` is owned by exactly one team.", namespace, type_name),
+        ],
+        ownership: Ownership {
+            team: team.clone(),
+            semantic_steward: Some("core-ontology".into()),
+        },
+        policy_class: PolicyClass::Internal,
+        locality: None,
+        doc: Some(format!("Heuristic-author-drafted type for: \"{}\".", prompt)),
+    };
+
+    let summary = format!("Draft a new `{}` type under `{}`.", type_name, namespace);
+
+    OntologyChangeProposal {
+        id: proposal_id,
+        domain,
+        namespace: namespace.clone(),
+        change_intent: summary.clone(),
+        rationale: rationale_for_createtype(prompt, &namespace, &type_name),
+        change: Change::CreateType { spec: new_type },
+        semantic_contract: SemanticContract {
+            meaning_before: "n/a — type does not exist yet".into(),
+            meaning_after: format!(
+                "`{}.{}` is the canonical representation of `{}` for the {} domain.",
+                namespace, type_name, type_name, prompt
+            ),
+            justification: Some(
+                "No existing concept in the catalogue covers this; new type drafted under \
+                 a `draft.*` namespace pending steward review."
+                    .into(),
+            ),
+            invariants: vec![
+                format!("Every `{}.{}` has a non-empty `id`.", namespace, type_name),
+                format!("`{}.{}.created_at` is monotonic per id.", namespace, type_name),
+            ],
+        },
+        compatibility: CompatibilityDeclaration::default(), // a brand-new type is purely additive
+        ownership: Ownership {
+            team,
+            semantic_steward: Some("core-ontology".into()),
+        },
+        tests: vec![
+            ProposalTest {
+                name: "type_namespacing".into(),
+                kind: "smoke".into(),
+                assertion: format!(
+                    "Inserting a `{}.{}` does not collide with any existing fully-qualified name.",
+                    namespace, type_name
+                ),
+            },
+            ProposalTest {
+                name: "additive_to_registry".into(),
+                kind: "compatibility".into(),
+                assertion: "Existing concept lookups are unaffected by the new draft type."
+                    .into(),
+            },
+        ],
+        provenance: Provenance {
+            author: actor.to_string(),
+            source_prompt: prompt.to_string(),
+            model: "offline-heuristic-v0".into(),
+            generated_at: Utc::now().to_rfc3339(),
+            trace_id: None,
+        },
+    }
+}
+
+/// Pull a (domain, TypeName) pair out of free text. Trivial: pick the first
+/// alphabetic word ≥4 chars as the domain, the first noun-ish word
+/// as the type name (PascalCased). Real model overrides this anyway.
+fn pick_domain_and_type_name(prompt: &str) -> (String, String) {
+    let stop: &[&str] = &[
+        "the", "a", "an", "to", "and", "or", "for", "of", "in", "on", "we",
+        "need", "want", "should", "must", "with", "from", "have", "users",
+        "user", "system", "agora",
+    ];
+    let toks: Vec<&str> = prompt
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|t| t.len() >= 4 && !stop.contains(&t.to_lowercase().as_str()))
+        .collect();
+
+    let domain = toks
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "misc".into());
+    let type_word = toks.get(1).copied().unwrap_or_else(|| toks.first().copied().unwrap_or("Concept"));
+    let type_name = pascal_case(type_word);
+
+    (domain, type_name)
+}
+
+fn pascal_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper = true;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if upper {
+                for u in ch.to_uppercase() {
+                    out.push(u);
+                }
+                upper = false;
+            } else {
+                out.push(ch.to_ascii_lowercase());
+            }
+        } else {
+            upper = true;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("Concept");
+    }
+    out
+}
+
+fn rationale_for_addfield(
+    prompt: &str,
+    namespace: &str,
+    type_name: &str,
+    field_name: &str,
+) -> String {
+    let lower = prompt.to_lowercase();
+    let why = if lower.contains("compliance") || lower.contains("audit") {
+        "compliance/audit signal"
+    } else if lower.contains("security") || lower.contains("biometric") {
+        "security-posture signal"
+    } else if lower.contains("preference") || lower.contains("opt") {
+        "user-preference signal"
+    } else {
+        "capability flag"
+    };
+    format!(
+        "Heuristic author: request reads as a {why} (\"{}\"). Modeled as an additive \
+         boolean field `{field_name}` on `{namespace}.{type_name}` so adoption is \
+         opt-in and no historical row interpretation changes."
+    , prompt)
+}
+
+fn rationale_for_createtype(prompt: &str, namespace: &str, type_name: &str) -> String {
+    format!(
+        "Heuristic author: request \"{}\" doesn't map onto any concept in the catalogue. \
+         Drafting a new type `{}.{}` under the `draft.*` namespace so it doesn't claim \
+         a stable canonical name before the semantic steward weighs in.",
+        prompt, namespace, type_name
+    )
 }

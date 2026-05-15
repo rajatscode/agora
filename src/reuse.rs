@@ -334,6 +334,67 @@ mod tests {
     }
 
     #[test]
+    fn novel_prompt_classifies_as_new() {
+        // Regression: validator caught that "cosmic ray sensors" was being
+        // force-fit onto BankIntegration → Refinement. Heuristic should now
+        // emit a CreateType under a fresh `draft.*` namespace, which has no
+        // exact match in the catalogue, and the embedding similarity to any
+        // existing concept is low → classified as `New`.
+        let prop = mock_proposal_from_prompt(
+            "cosmic ray sensors",
+            "user://test",
+            "prop_novel".into(),
+        );
+        // It must be a CreateType — not an AddField on something pre-existing.
+        match &prop.change {
+            crate::ast::Change::CreateType { spec } => {
+                assert!(
+                    spec.namespace.starts_with("draft."),
+                    "novel concept should land under draft.* namespace, got {}",
+                    spec.namespace
+                );
+            }
+            other => panic!("expected CreateType for novel prompt, got {:?}", other),
+        }
+        let report = classify(&prop, &baseline_concepts());
+        assert_eq!(
+            report.class,
+            ReuseClass::New,
+            "novel prompt should classify as New, got {:?} ({})",
+            report.class,
+            report.explanation
+        );
+    }
+
+    #[test]
+    fn semantic_contract_invariants_are_populated() {
+        // Regression: validator caught that semantic_contract.invariants
+        // was missing entirely from the schema. Heuristic author now must
+        // emit ≥2 invariants on every proposal, both code paths.
+        let add_field_prop = mock_proposal_from_prompt(
+            "users need biometric login on mobile",
+            "user://test",
+            "prop_a".into(),
+        );
+        assert!(
+            add_field_prop.semantic_contract.invariants.len() >= 2,
+            "AddField proposal must carry ≥2 invariants, got {}",
+            add_field_prop.semantic_contract.invariants.len()
+        );
+
+        let create_type_prop = mock_proposal_from_prompt(
+            "cosmic ray sensors",
+            "user://test",
+            "prop_b".into(),
+        );
+        assert!(
+            create_type_prop.semantic_contract.invariants.len() >= 2,
+            "CreateType proposal must carry ≥2 invariants, got {}",
+            create_type_prop.semantic_contract.invariants.len()
+        );
+    }
+
+    #[test]
     fn embedding_path_classifies_novel_target() {
         // Hand-build a proposal whose target FQN isn't in the catalogue,
         // so Layer 1 (exact) misses and the embedding+jaccard path runs.
@@ -368,6 +429,10 @@ mod tests {
                 meaning_before: "n/a".into(),
                 meaning_after: "Biometric authentication method capability per session.".into(),
                 justification: None,
+                invariants: vec![
+                    "Biometric_enrolled is set only after a successful enrolment ceremony.".into(),
+                    "Setting biometric_enrolled does not change LedgerSession's visibility class.".into(),
+                ],
             },
             compatibility: CompatibilityDeclaration::default(),
             ownership: Ownership {
