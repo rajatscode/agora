@@ -104,6 +104,8 @@ pub fn router(state: AppState) -> Router {
         .route("/concepts/:fqn", get(get_concept))
         // F6 — closed-loop agentic revision
         .route("/agent/run", post(run_agent_loop))
+        // DEMO-ONLY: wipe per-demo state + restore seeds. See `admin_reset`.
+        .route("/admin/reset", post(admin_reset))
         // Browser UI (Feature 4)
         .route("/", get(ui::home))
         .route("/ui/propose", post(ui::ui_propose))
@@ -621,6 +623,149 @@ async fn run_verify(
         .await
         .map_err(|e| ApiError::internal("verify_failed", e))?;
     Ok(Json(report))
+}
+
+/// ============================================================
+/// DEMO-ONLY: wipe per-demo state and re-run migrations to restore
+/// seeds. Used between practice runs so the previous run's
+/// mutation_log entries, written entities, and tampered rows don't
+/// pollute the next walkthrough.
+///
+/// What it touches:
+///   - `mutation_log`         — full truncate (entries are append-only
+///                              and grow per write)
+///   - `bank_integrations`    — truncate; re-seed via migration 001
+///   - `customers`            — truncate; re-seed via migration 005
+///   - `audit_findings`       — truncate; re-seed via migration 006
+///   - `authentication_methods` — truncate; re-seed via migration 003
+///
+/// What it does NOT touch:
+///   - `accounts` — the 47 NULL-email rows from migration 002 are
+///     the load-bearing seed for Beat 6's data-conformance proof.
+///     We delete any non-seed accounts (anything not matching the
+///     `acct_*` pattern) and let the ON CONFLICT DO NOTHING in
+///     migration 002 keep the seed count stable.
+///
+/// Re-running `db::migrate()` after the truncations is safe because
+/// every seed migration uses `ON CONFLICT DO NOTHING` (or
+/// `IF NOT EXISTS` at the table level). The advisory lock makes
+/// concurrent resets serialise the same way regular `migrate()`
+/// calls do.
+///
+/// NEVER EXPOSE THIS HANDLER OUTSIDE THE DEMO. It's bound to a
+/// well-known path and would let any caller wipe the operational
+/// substrate. Same posture as `/ui/tamper`.
+/// ============================================================
+#[derive(Debug, Serialize)]
+struct ResetCounts {
+    bank_integrations: i64,
+    customers: i64,
+    audit_findings: i64,
+    authentication_methods: i64,
+    accounts_non_seed_deleted: i64,
+    mutation_log: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminResetResp {
+    reset: bool,
+    entities_truncated: ResetCounts,
+    seeds_restored: ResetCounts,
+    elapsed_ms: u64,
+}
+
+async fn admin_reset(
+    State(state): State<AppState>,
+) -> Result<Json<AdminResetResp>, ApiError> {
+    let pool = state.require_db()?.clone();
+    do_admin_reset(pool).await.map(Json)
+}
+
+/// The reset body. Factored out of `admin_reset` and takes `PgPool` by
+/// value (cheap — PgPool is Arc-internal) so the long async chain
+/// doesn't carry a borrow of the State extractor's stack through every
+/// await. This keeps the handler's future Send + 'static, which Axum
+/// 0.7's `Handler` trait requires.
+async fn do_admin_reset(pool: PgPool) -> Result<AdminResetResp, ApiError> {
+    let pool = &pool;
+    let started = std::time::Instant::now();
+
+    let bi_count = count(pool, "SELECT COUNT(*) FROM bank_integrations").await?;
+    let cust_count = count(pool, "SELECT COUNT(*) FROM customers").await?;
+    let af_count = count(pool, "SELECT COUNT(*) FROM audit_findings").await?;
+    let am_count = count(pool, "SELECT COUNT(*) FROM authentication_methods").await?;
+    let acct_non_seed = count(
+        pool,
+        "SELECT COUNT(*) FROM accounts WHERE id NOT LIKE 'acct_%'",
+    )
+    .await?;
+    let ml_count = count(pool, "SELECT COUNT(*) FROM mutation_log").await?;
+    let truncated = ResetCounts {
+        bank_integrations: bi_count,
+        customers: cust_count,
+        audit_findings: af_count,
+        authentication_methods: am_count,
+        accounts_non_seed_deleted: acct_non_seed,
+        mutation_log: ml_count,
+    };
+
+    exec(pool, "TRUNCATE authentication_methods CASCADE").await?;
+    exec(pool, "TRUNCATE bank_integrations CASCADE").await?;
+    exec(pool, "TRUNCATE customers CASCADE").await?;
+    exec(pool, "TRUNCATE audit_findings CASCADE").await?;
+    exec(pool, "TRUNCATE mutation_log CASCADE").await?;
+    exec(pool, "DELETE FROM accounts WHERE id NOT LIKE 'acct_%'").await?;
+
+    // Re-seed. We use `db::SEED_BUNDLE` (idempotent INSERT-ON-CONFLICT)
+    // instead of `db::migrate()` because the latter acquires a
+    // PoolConnection and holds it across multiple inner awaits, which
+    // compounds with this handler's already-long future and trips
+    // Axum 0.7's Handler Send/'static bound. `sqlx::raw_sql` runs
+    // against the pool directly without an explicit connection hold.
+    sqlx::raw_sql(db::SEED_BUNDLE)
+        .execute(pool)
+        .await
+        .map_err(|e| ApiError::internal("reset_remigrate_failed", e))?;
+
+    let bi_after = count(pool, "SELECT COUNT(*) FROM bank_integrations").await?;
+    let cust_after = count(pool, "SELECT COUNT(*) FROM customers").await?;
+    let af_after = count(pool, "SELECT COUNT(*) FROM audit_findings").await?;
+    let am_after = count(pool, "SELECT COUNT(*) FROM authentication_methods").await?;
+    let ml_after = count(pool, "SELECT COUNT(*) FROM mutation_log").await?;
+    let restored = ResetCounts {
+        bank_integrations: bi_after,
+        customers: cust_after,
+        audit_findings: af_after,
+        authentication_methods: am_after,
+        accounts_non_seed_deleted: 0,
+        mutation_log: ml_after,
+    };
+
+    Ok(AdminResetResp {
+        reset: true,
+        entities_truncated: truncated,
+        seeds_restored: restored,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Helper: COUNT(*) → i64. Returns ApiError::internal on SQL failure.
+async fn count(pool: &PgPool, sql: &'static str) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(sql)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal("reset_count_failed", e))
+}
+
+/// Helper: execute a side-effecting statement, mapping errors to
+/// ApiError. We use string SQL because each TRUNCATE / DELETE here is
+/// hand-written and not user-influenced.
+async fn exec(pool: &PgPool, sql: &'static str) -> Result<(), ApiError> {
+    sqlx::query(sql)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| ApiError::internal("reset_exec_failed", e))
 }
 
 #[derive(Debug, Serialize)]

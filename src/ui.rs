@@ -1221,6 +1221,9 @@ fn verify_panel(report: &VerifyReport) -> Markup {
             div.body {
                 (drift_n) " tampered row(s) and " (oob_n) " out-of-band row(s) across " (report.entities_checked) " entities. The control plane caught what raw SQL changed."
             }
+            p style="margin:8px 0 0; font-size:12.5px; color:var(--text-muted);" {
+                "Showing field-level drift across all tracked entities — the row(s) below are what's currently out-of-sync with the mutation log (not just this demo's writes). Click into any row to see the logged-vs-current diff that pinpoints exactly which column changed."
+            }
         } }
     };
     html! {
