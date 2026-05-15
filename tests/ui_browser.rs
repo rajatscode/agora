@@ -80,6 +80,21 @@ async fn home_page_renders_all_eight_beats() {
         "expected inline HTMX bytes (htmx:load event reference) in home page"
     );
 
+    // Tab-switch click handler MUST attach to `document`, not
+    // `document.body`. The script runs from <head> before <body> exists,
+    // so the body variant throws TypeError at parse time and the handler
+    // never registers — Beat 4's artifact tabs would freeze on .proto and
+    // the demo would lose the SQL / handler / FGA reveals. Regression
+    // guard against re-introducing the bug.
+    assert!(
+        body.contains("document.addEventListener('click'"),
+        "tab handler must delegate off `document` (not document.body)"
+    );
+    assert!(
+        !body.contains("document.body.addEventListener"),
+        "document.body is null in <head>; use document.addEventListener instead"
+    );
+
     // All eight beat numbers must be visible at first paint.
     for (num, label) in [
         ("01 / 02", "Propose"),

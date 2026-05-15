@@ -73,13 +73,21 @@ const AGORA_CSS: &str = include_str!("../static/agora.css");
 /// Tiny vanilla-JS helper that wires the artifact tab strip. Six lines, no
 /// framework. Inlined into the home page <head> so subsequent HTMX-injected
 /// fragments can simply emit `.tab` / `.tab-panel` markup and have it work.
+///
+/// IMPORTANT: the listener attaches to `document`, NOT `document.body`. The
+/// script runs from <head> before <body> is parsed, so `document.body` is
+/// `null` at parse time — using it throws `TypeError: Cannot read
+/// properties of null` and the handler never registers, leaving the
+/// artifact tabs frozen on `.proto`. Event delegation off `document`
+/// works because `document` exists from the start of HTML parsing and
+/// click events bubble up to it from any descendant.
 const TAB_SCRIPT: &str = r#"
 function agoraSelectTab(group, name) {
   document.querySelectorAll('[data-tab-group="'+group+'"]').forEach(function(el){
     el.classList.toggle('active', el.dataset.tabName === name);
   });
 }
-document.body.addEventListener('click', function(e) {
+document.addEventListener('click', function(e) {
   var t = e.target.closest('[data-tab-trigger]');
   if (!t) return;
   agoraSelectTab(t.dataset.tabGroup, t.dataset.tabName);
