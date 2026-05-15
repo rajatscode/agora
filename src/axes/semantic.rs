@@ -412,6 +412,7 @@ mod tests {
                 generated_at: "now".into(),
                 trace_id: None,
             },
+            migration: None,
         }
     }
 

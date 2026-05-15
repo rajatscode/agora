@@ -19,10 +19,11 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use crate::ast::{
-    Change, CompatibilityClass, CompatibilityDeclaration, Field, OntologyChangeProposal,
-    OntologyType, Ownership, PolicyClass, ProposalTest, ProtoType, Provenance, SemanticContract,
-    TypeRef,
+    BackfillPlan, Change, CompatibilityClass, CompatibilityDeclaration, Field, MigrationPlan,
+    OntologyChangeProposal, OntologyType, Ownership, PolicyClass, ProposalTest, ProtoType,
+    Provenance, SemanticContract, TypeRef,
 };
+use crate::check_report::CheckReport;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -402,6 +403,27 @@ pub fn mock_proposal_from_prompt(
     let mentions_bank = lower.contains("bank") || lower.contains("integration");
     let mentions_user = lower.contains("user") || lower.contains("customer");
 
+    // Beat 6 / F6 case: "tighten Account.email to required" → TightenField.
+    // We surface this *before* the additive heuristics because the keyword
+    // "tighten" plus an email mention is a strong, narrow signal — it's the
+    // canonical refinement case Agora's data-conformance axis is built to
+    // catch, and the F6 agent loop needs to be able to produce it from a
+    // bare prompt when no API key is set.
+    if lower.contains("tighten")
+        || (lower.contains("required") && (lower.contains("email") || lower.contains("account")))
+    {
+        if let Some((namespace, type_name, field_name)) = guess_tighten_target(&lower) {
+            return author_tighten_field_on(
+                &namespace,
+                &type_name,
+                &field_name,
+                prompt,
+                actor,
+                proposal_id,
+            );
+        }
+    }
+
     if mentions_biometric || (mentions_login && mentions_bank) {
         return author_add_field_on(
             "core.integrations",
@@ -433,6 +455,159 @@ pub fn mock_proposal_from_prompt(
     // by both the classifier (no exact-match in catalog) AND the spec
     // (the change kind is CreateType).
     author_create_type_from(prompt, actor, proposal_id)
+}
+
+/// Maps a lowercased prompt onto a (namespace, TypeName, field_name) for
+/// the Tighten case. Narrow on purpose — recognizes the canonical Beat 6
+/// targets only. Anything outside this set falls back to the additive/
+/// create-type heuristics.
+fn guess_tighten_target(lower: &str) -> Option<(String, String, String)> {
+    if lower.contains("email") && (lower.contains("account") || lower.contains("user")) {
+        // Prefer Account because that's the seed catalog's optional-email
+        // concept (the one that has 47 NULL rows). User has email already
+        // required in the seed, so tightening it is a no-op.
+        if lower.contains("account") {
+            return Some((
+                "core.users".into(),
+                "Account".into(),
+                "email".into(),
+            ));
+        }
+        return Some((
+            "core.users".into(),
+            "User".into(),
+            "email".into(),
+        ));
+    }
+    // Heuristic: phrase like "tighten Foo.bar". Pull X and Y from the dotted
+    // reference if present in the prompt.
+    let toks: Vec<&str> = lower.split_whitespace().collect();
+    for t in toks {
+        if let Some((lhs, rhs)) = t.split_once('.') {
+            if lhs.chars().all(|c| c.is_ascii_alphabetic())
+                && rhs.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+                && !lhs.is_empty()
+                && !rhs.is_empty()
+            {
+                // Best guess at namespace.type
+                let type_name = pascal_case(lhs);
+                let namespace = if lhs == "account" || lhs == "user" {
+                    "core.users".into()
+                } else if lhs.contains("integration") || lhs.contains("bank") {
+                    "core.integrations".into()
+                } else {
+                    format!("core.{}", lhs)
+                };
+                return Some((namespace, type_name, rhs.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn author_tighten_field_on(
+    namespace: &str,
+    type_name: &str,
+    field_name: &str,
+    prompt: &str,
+    actor: &str,
+    proposal_id: String,
+) -> OntologyChangeProposal {
+    let target = TypeRef {
+        namespace: namespace.to_string(),
+        name: type_name.to_string(),
+    };
+    OntologyChangeProposal {
+        id: proposal_id,
+        domain: namespace.split('.').nth(1).unwrap_or("misc").to_string(),
+        namespace: namespace.to_string(),
+        change_intent: format!(
+            "Tighten {}.{}.{} from optional to required.",
+            namespace, type_name, field_name
+        ),
+        rationale: format!(
+            "Heuristic author: request \"{}\" reads as a refinement — tightening an existing \
+             optional field to required. Recorded as a `tighten_field` so the data-conformance \
+             axis can verify against live rows.",
+            prompt
+        ),
+        change: Change::TightenField {
+            type_ref: target.clone(),
+            field_name: field_name.to_string(),
+            from_required: false,
+            to_required: true,
+        },
+        semantic_contract: SemanticContract {
+            meaning_before: format!(
+                "`{}.{}.{}` is optional; existing rows may have NULL.",
+                namespace, type_name, field_name
+            ),
+            meaning_after: format!(
+                "Every `{}.{}` row carries a non-null `{}`.",
+                namespace, type_name, field_name
+            ),
+            justification: Some(
+                "Refines the meaning of the concept by strengthening an invariant. Existing \
+                 NULL rows must be backfilled before this can ship."
+                    .into(),
+            ),
+            invariants: vec![
+                format!("Every `{}.{}` has a non-null `{}`.", namespace, type_name, field_name),
+                format!(
+                    "No new `{}.{}` may be created with `{}` = NULL.",
+                    namespace, type_name, field_name
+                ),
+            ],
+        },
+        compatibility: CompatibilityDeclaration {
+            shape: CompatibilityClass::Refinement,
+            semantic: CompatibilityClass::Refinement,
+            temporal: CompatibilityClass::Refinement,
+            policy: CompatibilityClass::Additive,
+            api: CompatibilityClass::Refinement,
+            storage: CompatibilityClass::Refinement,
+        },
+        ownership: Ownership {
+            team: if namespace == "core.users" {
+                "identity-platform".into()
+            } else if namespace == "core.integrations" {
+                "integrations-platform".into()
+            } else {
+                "core-ontology".into()
+            },
+            semantic_steward: Some("core-ontology".into()),
+        },
+        tests: vec![
+            ProposalTest {
+                name: format!("no_null_{}_post_migration", field_name),
+                kind: "invariant".into(),
+                assertion: format!(
+                    "After migration, no `{}.{}` row has `{}` = NULL.",
+                    namespace, type_name, field_name
+                ),
+            },
+            ProposalTest {
+                name: format!("create_rejects_null_{}", field_name),
+                kind: "compatibility".into(),
+                assertion: format!(
+                    "Creating a `{}.{}` with `{}` omitted returns 400.",
+                    namespace, type_name, field_name
+                ),
+            },
+        ],
+        provenance: Provenance {
+            author: actor.to_string(),
+            source_prompt: prompt.to_string(),
+            model: "offline-heuristic-v0".into(),
+            generated_at: Utc::now().to_rfc3339(),
+            trace_id: None,
+        },
+        // Intentionally NO migration plan on the first author. The F6
+        // agent loop revision is what populates this — the first attempt is
+        // supposed to be reckless about backfill, so the gate has a real
+        // reason to block.
+        migration: None,
+    }
 }
 
 fn author_add_field_on(
@@ -523,6 +698,7 @@ fn author_add_field_on(
             generated_at: Utc::now().to_rfc3339(),
             trace_id: None,
         },
+        migration: None,
     }
 }
 
@@ -627,6 +803,7 @@ fn author_create_type_from(
             generated_at: Utc::now().to_rfc3339(),
             trace_id: None,
         },
+        migration: None,
     }
 }
 
@@ -707,4 +884,351 @@ fn rationale_for_createtype(prompt: &str, namespace: &str, type_name: &str) -> S
          a stable canonical name before the semantic steward weighs in.",
         prompt, namespace, type_name
     )
+}
+
+// ============================================================================
+// Feature 6 — revise_proposal: closed-loop revision in response to a block.
+// ============================================================================
+//
+// The agent loop calls this when the multi-axis check rejects the previous
+// attempt. The job here is to feed the **structured CheckReport** back to
+// the LLM (or the offline heuristic) and emit a new proposal that addresses
+// the rejection. The classic case the F6 brief targets: data_conformance
+// blocked the previous attempt → the revision adds `migration.backfill_plan`
+// so DC flips to Advisory and the gate clears it.
+//
+// We deliberately do NOT just "retry the prompt" — that wouldn't be closed
+// loop. The revision call gets the full prior proposal AND the rejection
+// rationale, so it can target the specific axis that failed.
+
+const REVISE_SYSTEM_PROMPT: &str = "\
+You are Agora's revision agent. You receive: (a) the original user request, \
+(b) a previous OntologyChangeProposal that was BLOCKED by Agora's multi-axis \
+risk gate, and (c) the structured CheckReport explaining which axes failed \
+and why. Your job is to emit a single REVISED proposal that addresses the \
+rejection.
+
+Hard rules:
+1. Always call the `emit_proposal` tool exactly once. Never reply in prose.
+2. Preserve the same `change` (kind, target, field name) unless the rejection \
+   makes that change fundamentally impossible. If the change is salvageable \
+   with a migration plan, populate `migration.backfill_plan` rather than \
+   abandoning the change.
+3. If the rejection cites `data_conformance` (existing rows would violate the \
+   proposed constraint), you MUST populate `migration.backfill_plan` with a \
+   concrete strategy. Set `strategy` to a short slug, `source` to where the \
+   values come from (a column, a constant, a derivation), and \
+   `idempotent: true` if rerunning the backfill is safe. Also set \
+   `migration.backfill_query` to the SQL UPDATE you would run.
+4. If the rejection cites `policy` (PII visibility), tighten the field's \
+   classification rather than widen it.
+5. Carry forward the original `id`, `domain`, `namespace`, `ownership` unless \
+   the rejection explicitly demands a different owner.
+6. Keep `compatibility` honest about the post-revision shape — a refinement \
+   with a backfill_plan is still `refinement` on shape/semantic, but the \
+   semantic_contract.justification should mention the backfill commitment.";
+
+/// Public entry. Given the original prompt, the blocked proposal, and its
+/// CheckReport, produce a revised proposal that targets the rejection.
+///
+/// Returns `(revised_proposal, mode, reason_summary)`. `reason_summary` is a
+/// short one-liner the UI shows verbatim ("added backfill_plan:
+/// derive_from_provider_config") so the demo audience can see exactly what
+/// the revision changed.
+pub async fn revise_proposal(
+    original_prompt: &str,
+    previous: &OntologyChangeProposal,
+    check_report: &CheckReport,
+    actor: &str,
+) -> Result<(OntologyChangeProposal, AuthorMode, String)> {
+    // We always preserve the previous proposal's id so the artifact directory
+    // tracks one logical proposal across the revision arc.
+    let preserved_id = previous.id.clone();
+
+    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        match call_anthropic_revise(&api_key, original_prompt, previous, check_report).await {
+            Ok(mut revised) => {
+                revised.id = preserved_id;
+                revised.provenance = Provenance {
+                    author: actor.to_string(),
+                    source_prompt: original_prompt.to_string(),
+                    model: std::env::var("ANTHROPIC_MODEL")
+                        .unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+                    generated_at: Utc::now().to_rfc3339(),
+                    trace_id: None,
+                };
+                let reason = summarize_revision(previous, &revised);
+                return Ok((revised, AuthorMode::Live, reason));
+            }
+            Err(e) => {
+                let err_summary = format!("{e}");
+                tracing::warn!(
+                    "Anthropic revision call failed ({err_summary}); falling back to deterministic heuristic"
+                );
+                let (revised, reason) =
+                    heuristic_revise(original_prompt, previous, check_report, actor);
+                return Ok((revised, AuthorMode::OfflineApiError { error: err_summary }, reason));
+            }
+        }
+    }
+
+    tracing::warn!("ANTHROPIC_API_KEY unset; using deterministic heuristic revision");
+    let (revised, reason) = heuristic_revise(original_prompt, previous, check_report, actor);
+    Ok((revised, AuthorMode::OfflineNoKey, reason))
+}
+
+async fn call_anthropic_revise(
+    api_key: &str,
+    original_prompt: &str,
+    previous: &OntologyChangeProposal,
+    check_report: &CheckReport,
+) -> Result<OntologyChangeProposal> {
+    let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+    let endpoint = std::env::var("ANTHROPIC_ENDPOINT")
+        .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".into());
+
+    let previous_json = serde_json::to_string_pretty(previous)
+        .unwrap_or_else(|_| "{ /* serialize failed */ }".into());
+    let report_json = serde_json::to_string_pretty(check_report)
+        .unwrap_or_else(|_| "{ /* serialize failed */ }".into());
+
+    let body = json!({
+        "model": model,
+        "max_tokens": 2048,
+        "tool_choice": { "type": "tool", "name": "emit_proposal" },
+        "tools": [{
+            "name": "emit_proposal",
+            "description": "Emit one REVISED OntologyChangeProposal that addresses the rejection.",
+            // Reuse the authoring schema verbatim — same structure, with the
+            // optional `migration` field that the revise system prompt
+            // instructs the model to populate. The structurally-richer schema
+            // is what makes data_conformance failures actually addressable.
+            "input_schema": revise_input_schema()
+        }],
+        "system": REVISE_SYSTEM_PROMPT,
+        "messages": [{
+            "role": "user",
+            "content": format!(
+                "ORIGINAL REQUEST:\n{}\n\n\
+                 PREVIOUS PROPOSAL (BLOCKED):\n```json\n{}\n```\n\n\
+                 CHECK REPORT (explains the block):\n```json\n{}\n```\n\n\
+                 Emit a single revised proposal that addresses the rejection. \
+                 Preserve the original change kind and target unless impossible. \
+                 If the rejection cites data_conformance, you MUST populate \
+                 migration.backfill_plan.",
+                original_prompt, previous_json, report_json
+            )
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&endpoint)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .context("anthropic revise request failed")?;
+
+    let status = resp.status();
+    let raw: Value = resp.json().await.context("anthropic revise response not JSON")?;
+
+    if !status.is_success() {
+        return Err(anyhow!("anthropic {} → {}", status, raw));
+    }
+
+    let content = raw
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| anyhow!("revise response missing `content`: {raw}"))?;
+
+    let tool_input = content
+        .iter()
+        .find_map(|block| {
+            if block.get("type")?.as_str()? == "tool_use" {
+                block.get("input").cloned()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow!("revise model did not emit a tool_use block"))?;
+
+    let proposal: OntologyChangeProposal =
+        serde_json::from_value(tool_input).context("revise tool_use.input did not match schema")?;
+    Ok(proposal)
+}
+
+/// JSON Schema for the revise call. Same as the authoring schema, plus an
+/// optional top-level `migration` object so the model is told the field
+/// exists and is the right answer for data_conformance failures.
+fn revise_input_schema() -> Value {
+    // Start with the authoring schema and graft the `migration` property
+    // onto its `properties` map. This keeps the two in lock-step — if
+    // proposal_input_schema() changes, the revise schema picks it up.
+    let mut schema = proposal_input_schema();
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        props.insert(
+            "migration".into(),
+            json!({
+                "type": "object",
+                "description": "Migration commitment. Populate `backfill_plan` when the rejection cites data_conformance.",
+                "properties": {
+                    "backfill_plan": {
+                        "type": "object",
+                        "required": ["strategy"],
+                        "properties": {
+                            "strategy":   { "type": "string", "description": "Short slug, e.g. 'derive_from_provider_config'." },
+                            "source":     { "type": "string", "description": "Where backfill values come from." },
+                            "idempotent": { "type": "boolean" },
+                            "rationale":  { "type": "string" }
+                        }
+                    },
+                    "backfill_query":    { "type": "string", "description": "SQL the backfill would run." },
+                    "dual_write_window": { "type": "string", "description": "How long the compatibility window lasts." }
+                }
+            }),
+        );
+    }
+    schema
+}
+
+/// Deterministic offline fallback. Inspects the previous proposal + check
+/// report; if the block cites data_conformance (or the previous change is a
+/// TightenField that we know would fail), emit a revision that adds a
+/// `migration.backfill_plan` targeting that field. Otherwise we re-emit the
+/// previous proposal with a small bump to the rationale — which will still
+/// fail the gate on the next attempt, surfacing as Stalled. That's
+/// intentional: the offline path is honest about its narrow competence.
+fn heuristic_revise(
+    _original_prompt: &str,
+    previous: &OntologyChangeProposal,
+    check_report: &CheckReport,
+    actor: &str,
+) -> (OntologyChangeProposal, String) {
+    let block_reason = check_report.block_reason.clone().unwrap_or_default();
+    let dc_failed = block_reason.contains("data_conformance")
+        || matches!(
+            check_report.data_conformance.outcome,
+            crate::check_report::Outcome::Fail | crate::check_report::Outcome::Skipped
+        ) && check_report.data_conformance.applicable;
+
+    // Case 1: data_conformance failure on a TightenField — add a backfill_plan.
+    if dc_failed {
+        if let Change::TightenField {
+            type_ref,
+            field_name,
+            ..
+        } = &previous.change
+        {
+            let (strategy, source, query) =
+                heuristic_backfill_for(&type_ref.fqn(), field_name);
+            let mut revised = previous.clone();
+            revised.migration = Some(MigrationPlan {
+                backfill_plan: Some(BackfillPlan {
+                    strategy: strategy.clone(),
+                    source: Some(source.clone()),
+                    idempotent: true,
+                    rationale: Some(format!(
+                        "Backfill {}.{} from {} so the tightening is safe against the {} \
+                         existing violating row(s) the data-conformance axis surfaced.",
+                        type_ref.fqn(),
+                        field_name,
+                        source,
+                        check_report.data_conformance.violations_found
+                    )),
+                }),
+                backfill_query: Some(query),
+                dual_write_window: Some("14d".into()),
+            });
+            revised.rationale = format!(
+                "{} | Revised by agent loop: added backfill_plan to address {} existing \
+                 row(s) flagged by data_conformance.",
+                revised.rationale, check_report.data_conformance.violations_found
+            );
+            // Keep id stable across revisions; refresh provenance so the
+            // audit trail shows the loop touched it.
+            revised.provenance = Provenance {
+                author: actor.to_string(),
+                source_prompt: previous.provenance.source_prompt.clone(),
+                model: "offline-revise-v0".into(),
+                generated_at: Utc::now().to_rfc3339(),
+                trace_id: None,
+            };
+            let reason = format!("added migration.backfill_plan ({strategy})");
+            return (revised, reason);
+        }
+    }
+
+    // Case 2: nothing we know how to fix deterministically. Re-emit the
+    // previous proposal unchanged with a noted rationale — the loop will see
+    // no progress and (eventually) Stall, which is the honest outcome.
+    let mut unchanged = previous.clone();
+    unchanged.provenance = Provenance {
+        author: actor.to_string(),
+        source_prompt: previous.provenance.source_prompt.clone(),
+        model: "offline-revise-v0".into(),
+        generated_at: Utc::now().to_rfc3339(),
+        trace_id: None,
+    };
+    let reason = format!(
+        "no deterministic revision available for block: {}",
+        if block_reason.is_empty() {
+            "(unspecified)".into()
+        } else {
+            block_reason
+        }
+    );
+    (unchanged, reason)
+}
+
+/// Pick a sensible backfill strategy/source pair for the known (concept, field)
+/// pairs in the seed catalog. The list is intentionally short — this is the
+/// offline path; the live path delegates judgment to the LLM.
+fn heuristic_backfill_for(target_fqn: &str, field_name: &str) -> (String, String, String) {
+    match (target_fqn, field_name) {
+        ("core.users.Account", "email") => (
+            "derive_from_user_record".into(),
+            "users.email WHERE users.account_id = accounts.id, else '<unknown>@placeholder.invalid'".into(),
+            "UPDATE accounts a SET email = COALESCE((SELECT u.email FROM users u WHERE u.account_id = a.id), '<unknown>@placeholder.invalid') WHERE a.email IS NULL".into(),
+        ),
+        _ => (
+            "default_to_placeholder".into(),
+            format!("constant: '<unknown>' for {}.{}", target_fqn, field_name),
+            format!(
+                "/* concrete table+column mapping not in heuristic catalog for {} — \
+                 a real revision would consult the storage binding registry */",
+                target_fqn
+            ),
+        ),
+    }
+}
+
+/// Short, demo-friendly summary of *what* the revision changed.
+fn summarize_revision(prev: &OntologyChangeProposal, revised: &OntologyChangeProposal) -> String {
+    let added_backfill = prev.migration.as_ref().map(|m| m.has_backfill()).unwrap_or(false)
+        == false
+        && revised
+            .migration
+            .as_ref()
+            .map(|m| m.has_backfill())
+            .unwrap_or(false);
+    if added_backfill {
+        let strat = revised
+            .migration
+            .as_ref()
+            .and_then(|m| m.backfill_plan.as_ref())
+            .map(|b| b.strategy.clone())
+            .unwrap_or_else(|| "unspecified".into());
+        return format!("added migration.backfill_plan ({})", strat);
+    }
+    // Compatibility-class softening?
+    if prev.compatibility.policy != revised.compatibility.policy {
+        return format!(
+            "narrowed policy classification ({:?} → {:?})",
+            prev.compatibility.policy, revised.compatibility.policy
+        );
+    }
+    "revised rationale/contract".into()
 }

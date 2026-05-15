@@ -212,6 +212,60 @@ impl Default for CompatibilityDeclaration {
     }
 }
 
+// -------- migration plan (Feature 6) --------
+//
+// A proposal may declare *how* it intends to deal with existing data that
+// would violate the new invariant. When `migration.backfill_plan` is present,
+// the data-conformance axis treats discovered violations as **mitigated**
+// (Advisory) rather than blocking (Fail) — the gate accepts that the
+// migration step will fix them at apply time.
+//
+// This is what the F6 agent loop populates on a revision: the first attempt
+// has `migration: None` (no plan, gate blocks); the revision reads the
+// rejection rationale and emits a new proposal with `backfill_plan` filled in.
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackfillPlan {
+    /// Short label for the chosen strategy, e.g. "derive_from_provider_config",
+    /// "default_to_empty_string", "block_apply_until_manual_resolution".
+    pub strategy: String,
+    /// Where the backfill values come from. Free text for M0.
+    /// E.g. "users.metadata->>'contact_email'" or "constant: '<unknown>@placeholder'".
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Is re-running the backfill safe? Most demos default to true; we keep
+    /// it explicit so a non-idempotent plan stands out.
+    #[serde(default)]
+    pub idempotent: bool,
+    /// Free-text rationale for the chosen strategy. Surfaced verbatim in the
+    /// check report so a reviewer can quote it.
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MigrationPlan {
+    /// Present iff this proposal commits to addressing existing-data
+    /// violations at migration time. Absent = "no plan" = gate must block.
+    #[serde(default)]
+    pub backfill_plan: Option<BackfillPlan>,
+    /// Optional SQL the backfill would run. Not executed by Agora — surfaced
+    /// in the report so reviewers can audit the actual statement.
+    #[serde(default)]
+    pub backfill_query: Option<String>,
+    /// How long the dual-write / compatibility window should be (free text:
+    /// "14d", "until 2026-06-01", etc). Demo-grade, not parsed.
+    #[serde(default)]
+    pub dual_write_window: Option<String>,
+}
+
+impl MigrationPlan {
+    /// Does this plan offer a concrete mitigation for existing violations?
+    pub fn has_backfill(&self) -> bool {
+        self.backfill_plan.is_some()
+    }
+}
+
 // -------- tests + provenance --------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +303,13 @@ pub struct OntologyChangeProposal {
     #[serde(default)]
     pub tests: Vec<ProposalTest>,
     pub provenance: Provenance,
+    /// Optional migration commitment — when present, declares how the
+    /// proposal intends to handle existing-data violations. The F2
+    /// data-conformance axis reads `migration.backfill_plan` and uses its
+    /// presence as mitigating evidence (Advisory) instead of blocking (Fail).
+    /// Populated by the F6 agent loop on revision attempts.
+    #[serde(default)]
+    pub migration: Option<MigrationPlan>,
 }
 
 impl OntologyChangeProposal {

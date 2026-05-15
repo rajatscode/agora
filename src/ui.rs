@@ -48,6 +48,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::agent::{self, ActionTaken, AgentResult, Attempt, FinalStatus};
 use crate::artifacts;
 use crate::ast::OntologyChangeProposal;
 use crate::check;
@@ -178,6 +179,32 @@ pub async fn home() -> Markup {
                     }
                 }
                 div id="beat-6-slot" {}
+            },
+        ))
+
+        (beat_section(
+            "06½",
+            "Agent loop — revise on rejection (F6)",
+            "The vision driver. Beat 6 showed Agora blocking a risky proposal. Here the agent reads the structured rejection, revises the proposal with a migration plan, and re-submits — closing the loop. Each attempt is rendered as its own card with the verdict and the action taken; both successes and failures are visible so the audience can see what happened.",
+            html! {
+                form
+                    hx-post="/ui/agent"
+                    hx-target="#beat-65-slot"
+                    hx-swap="innerHTML"
+                    hx-disabled-elt="find button"
+                {
+                    textarea
+                        name="prompt"
+                        rows="2"
+                        placeholder="tighten Account.email to required for compliance" {
+                        "tighten Account.email to required for compliance"
+                    }
+                    div.row.right {
+                        button type="submit" { "Run agent loop →" }
+                    }
+                    p.hint { "Up to " code { "MAX_ATTEMPTS = 3" } " attempts. Author→check→(revise→check){0..2}. Live LLM revision when " code { "ANTHROPIC_API_KEY" } " is set; deterministic offline heuristic that adds " code { "migration.backfill_plan" } " otherwise." }
+                }
+                div id="beat-65-slot" {}
             },
         ))
 
@@ -406,6 +433,48 @@ pub async fn ui_risky_proposal(
     Ok(html! {
         (check_report_panel(&report, &proposal.id, true))
     })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentRunForm {
+    pub prompt: String,
+}
+
+/// F6 handler — runs the closed-loop revision and renders every attempt as
+/// its own card. The first attempt's card is amber/red if blocked, green if
+/// approved; subsequent (revision) cards display the action taken
+/// ("added migration.backfill_plan …") so the audience can see *what
+/// changed* between attempts.
+pub async fn ui_agent_run(
+    State(state): State<AppState>,
+    Form(form): Form<AgentRunForm>,
+) -> Result<Markup, UiError> {
+    if form.prompt.trim().is_empty() {
+        return Err(UiError::bad_request("prompt is empty"));
+    }
+
+    let result = agent::agent_loop(&form.prompt, state.catalog.as_slice(), state.pool.as_ref())
+        .await
+        .map_err(|e| UiError::internal(format!("agent_loop failed: {e}")))?;
+
+    // Persist final-attempt artifacts so the rest of the demo (e.g. /ui/concepts)
+    // can link to the resulting proposal.
+    if let Some(final_attempt) = result.attempts.last() {
+        let dir = state.generated_root.join(&final_attempt.proposal.id);
+        if std::fs::create_dir_all(&dir).is_ok() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&final_attempt.proposal) {
+                let _ = std::fs::write(dir.join("proposal.json"), bytes);
+            }
+            if let Ok(bytes) = serde_json::to_vec_pretty(&final_attempt.check_report) {
+                let _ = std::fs::write(dir.join("check_report.json"), bytes);
+            }
+            if let Ok(bytes) = serde_json::to_vec_pretty(&result) {
+                let _ = std::fs::write(dir.join("agent_run.json"), bytes);
+            }
+        }
+    }
+
+    Ok(agent_result_panel(&result))
 }
 
 #[derive(Debug, Deserialize)]
@@ -821,6 +890,119 @@ fn approval_panel(report: &CheckReport) -> Markup {
                 dt { "status" } dd { span.pill.fail { "blocked" } }
                 dt { "predicate" } dd { span.mono { "auto_approval::apply ⇒ all_axes_clean=false" } }
                 dt { "report id" } dd { span.id { (report.proposal_id) } }
+            }
+        }
+    }
+}
+
+/// Render the full AgentResult — one banner summarising the run outcome,
+/// then one card per attempt. The cards intentionally stack vertically so
+/// the demo audience reads them top-down as a conversation: "I proposed X
+/// → blocked because Y → I revised to add Z → approved."
+fn agent_result_panel(result: &AgentResult) -> Markup {
+    let banner: Markup = match result.final_status {
+        FinalStatus::Approved => html! {
+            div.box.success {
+                span.strong { "Approved after " (result.attempts.len()) " attempt(s)." }
+                div.body {
+                    "The agent loop closed: the final attempt is auto-approval-eligible. "
+                    "All " (result.attempts.len()) " attempts are shown below — the revision trail is auditable."
+                }
+            }
+        },
+        FinalStatus::Stalled => html! {
+            div.box.error {
+                span.strong { "Stalled after " (result.attempts.len()) " attempt(s)." }
+                div.body {
+                    "No revision unblocked the gate within the attempt budget. "
+                    "All attempts are shown below — the failures are the explanation."
+                }
+            }
+        },
+    };
+
+    html! {
+        (banner)
+        p.hint style="margin-top:8px" {
+            "Loop completed at " span.mono { (result.completed_at) }
+            " · prompt = " span.mono { (result.prompt) }
+        }
+        @for attempt in &result.attempts {
+            (attempt_card(attempt))
+        }
+    }
+}
+
+fn attempt_card(attempt: &Attempt) -> Markup {
+    let eligible = attempt.check_report.auto_approval_eligible;
+    let box_class = if eligible { "box success" } else { "box warn" };
+    let action_label = match &attempt.action_taken {
+        ActionTaken::Authored => "authored from prompt".to_string(),
+        ActionTaken::Revised { reason } => format!("revised — {reason}"),
+    };
+    let target = attempt.proposal.target().fqn();
+    let dc = &attempt.check_report.data_conformance;
+
+    html! {
+        div class=(box_class) style="margin-top:14px" {
+            div.row style="justify-content:space-between; align-items:baseline" {
+                div {
+                    span.strong { "Attempt " (attempt.attempt_num) }
+                    " — " (action_label)
+                }
+                div {
+                    (author_mode_pill(&attempt.author_mode))
+                    " "
+                    @if eligible {
+                        span.pill.pass { "approved" }
+                    } @else {
+                        span.pill.fail { "blocked" }
+                    }
+                }
+            }
+            dl.kv style="margin-top:10px" {
+                dt { "Proposal" } dd { span.id { (attempt.proposal.id) } " · target " span.id { (target) } }
+                dt { "Change intent" } dd { (attempt.proposal.change_intent) }
+                @if let Some(mig) = &attempt.proposal.migration {
+                    @if let Some(plan) = &mig.backfill_plan {
+                        dt { "Backfill plan" }
+                        dd {
+                            span.mono { "strategy=" (plan.strategy) }
+                            @if let Some(src) = &plan.source {
+                                " · " span.mono { "source=" (src) }
+                            }
+                            " · " span.mono { "idempotent=" (plan.idempotent) }
+                        }
+                        @if let Some(rat) = &plan.rationale {
+                            dt { "Backfill rationale" } dd { (rat) }
+                        }
+                        @if let Some(q) = &mig.backfill_query {
+                            dt { "Backfill query" }
+                            dd { pre.code style="margin:0" { code { (q) } } }
+                        }
+                    }
+                }
+                dt { "Block reason" }
+                dd {
+                    @if let Some(r) = &attempt.check_report.block_reason {
+                        span.mono { (r) }
+                    } @else {
+                        "—"
+                    }
+                }
+            }
+            @if eligible {
+                p.hint style="margin-top:8px" {
+                    "All axes clean. data_conformance source = " span.mono { (dc.source) }
+                    @if dc.applicable && dc.violations_found > 0 {
+                        " · " span.mono { (dc.violations_found) }
+                        " row(s) flagged but mitigated by backfill_plan (Advisory)."
+                    }
+                }
+            } @else {
+                p.hint style="margin-top:8px" {
+                    "Gate blocked. The revision step gets this full report (block_reason + per-axis evidence) as input."
+                }
             }
         }
     }

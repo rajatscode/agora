@@ -35,3 +35,5 @@ pub mod explorer;
 
 pub mod daemon;
 pub mod ui;
+
+pub mod agent;

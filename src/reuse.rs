@@ -478,6 +478,7 @@ mod tests {
                 generated_at: "now".into(),
                 trace_id: None,
             },
+            migration: None,
         };
         let report = classify(&prop, &baseline_concepts());
         // Either Reuse or New is acceptable — the point is that we
