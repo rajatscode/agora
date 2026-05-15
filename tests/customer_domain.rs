@@ -303,6 +303,117 @@ async fn customer_write_denied_for_non_owner_team_logs_deny_attempt() {
 }
 
 #[tokio::test]
+async fn verify_does_not_flag_denied_customer_as_drift_and_does_flag_seeded_rows_as_oob() {
+    // F8 send-back: verify() must iterate the customers table now. This
+    // proves three properties at once:
+    //   (a) A handler-written Customer row appears in NEITHER tampered
+    //       nor outofband (verify reconciles it against its log row).
+    //   (b) A denied Customer write appears in NEITHER bucket (no entity
+    //       row was inserted; nothing for verify to flag).
+    //   (c) The 20 seeded customers — inserted by migration 005, which
+    //       bypasses the handler — DO appear in `outofband_entities`,
+    //       same as the 47 acct_null_* seed rows do for the accounts
+    //       table. This is the same "every row Agora didn't see is
+    //       flagged" property F4 surfaced for accounts.
+    let Some((base, _tmp, pool)) = boot_server_with_db().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+
+    // (a) handler-written allow.
+    let allow_id = format!("cust_f8_oob_allow_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let resp = client()
+        .post(format!("{base}/entities/Customer"))
+        .json(&serde_json::json!({
+            "entity_id": allow_id,
+            "email": "ok@example.com",
+            "actor": "team:customer-platform",
+        }))
+        .send()
+        .await
+        .expect("write");
+    assert_eq!(resp.status(), 200);
+
+    // (b) handler-denied write.
+    let deny_id = format!("cust_f8_oob_deny_{}", &Uuid::new_v4().simple().to_string()[..10]);
+    let resp = client()
+        .post(format!("{base}/entities/Customer"))
+        .json(&serde_json::json!({
+            "entity_id": deny_id,
+            "actor": "team:marketing",
+        }))
+        .send()
+        .await
+        .expect("write");
+    assert_eq!(resp.status(), 403);
+
+    // Run verify.
+    let body: Value = client()
+        .get(format!("{base}/verify"))
+        .send()
+        .await
+        .expect("verify")
+        .json()
+        .await
+        .expect("verify json");
+
+    let tampered: Vec<&str> = body["tampered_entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["entity_id"].as_str())
+        .collect();
+    let oob: Vec<(&str, &str)> = body["outofband_entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| Some((e["entity_type"].as_str()?, e["entity_id"].as_str()?)))
+        .collect();
+
+    // (a) handler-written allow row: in neither bucket.
+    assert!(
+        !tampered.contains(&allow_id.as_str()),
+        "handler-written customer must not be flagged as drift; got: {tampered:?}"
+    );
+    let allow_in_oob = oob.iter().any(|(_, id)| *id == allow_id);
+    assert!(
+        !allow_in_oob,
+        "handler-written customer must not be flagged as oob; got: {oob:?}"
+    );
+
+    // (b) denied row: in neither bucket — nothing was inserted.
+    assert!(
+        !tampered.contains(&deny_id.as_str()),
+        "denied customer must not be flagged as drift"
+    );
+    assert!(
+        !oob.iter().any(|(_, id)| *id == deny_id),
+        "denied customer must not be flagged as oob"
+    );
+
+    // (c) the 20 seeded `cust_001..cust_020` rows: they bypass the
+    // handler (migration 005 inserts them directly) so they MUST appear
+    // in outofband. This is the F4 property applied to the new domain.
+    let oob_customer_ids: Vec<&str> = oob
+        .iter()
+        .filter(|(t, _)| *t == TYPE_CUSTOMER)
+        .map(|(_, id)| *id)
+        .collect();
+    let seeded_present = (1..=20)
+        .map(|n| format!("cust_{:03}", n))
+        .filter(|sid| oob_customer_ids.contains(&sid.as_str()))
+        .count();
+    assert!(
+        seeded_present >= 15,
+        "expected ≥15 of the 20 seeded customers to surface as out-of-band; \
+         found {seeded_present}. oob customer ids: {oob_customer_ids:?}"
+    );
+
+    cleanup(&pool, &allow_id).await;
+    cleanup(&pool, &deny_id).await;
+}
+
+#[tokio::test]
 async fn customer_risky_tighten_blocks_on_real_db_with_violation_count() {
     let Some((_base, _tmp, pool)) = boot_server_with_db().await else {
         eprintln!("skipping: DATABASE_URL not set");
