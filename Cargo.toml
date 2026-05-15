@@ -7,6 +7,10 @@ edition = "2021"
 name = "agora"
 path = "src/main.rs"
 
+[[bin]]
+name = "agorad"
+path = "src/bin/agorad.rs"
+
 [lib]
 name = "agora"
 path = "src/lib.rs"
@@ -63,3 +67,7 @@ hex = "0.4"
 
 [build-dependencies]
 prost-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+

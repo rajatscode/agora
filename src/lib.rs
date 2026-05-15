@@ -32,3 +32,5 @@ pub mod mutation_log;
 pub mod entity_write;
 pub mod verify;
 pub mod explorer;
+
+pub mod daemon;
