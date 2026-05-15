@@ -91,7 +91,11 @@ async fn write_creates_entity_and_log_row_with_matching_checksum() {
     assert_eq!(latest.checksum.as_deref(), Some(outcome.checksum.as_str()));
     assert_eq!(latest.operation, "Create");
     assert_eq!(latest.ontology_version, 2);
-    assert_eq!(latest.actor, "http-handler");
+    // F5: the legacy `apply_create_bank_integration` entry point now
+    // delegates to the authzed variant with default actor =
+    // team:integrations-platform (the policy-permitted owner) so the
+    // historical "http-handler" label has been promoted to a real actor.
+    assert_eq!(latest.actor, "team:integrations-platform");
 
     cleanup(&pool, &entity_id).await;
 }
@@ -228,7 +232,9 @@ async fn explorer_returns_history_including_our_write() {
         .find(|h| h.mutation_seq == outcome.mutation_seq)
         .expect("our write in history");
     assert_eq!(entry.entity_id, entity_id);
-    assert_eq!(entry.actor, "http-handler");
+    // F5: see mutation_log_verify.rs:~95 — default actor is now the
+    // owner team, not the generic "http-handler" label.
+    assert_eq!(entry.actor, "team:integrations-platform");
     assert_eq!(entry.checksum.as_deref(), Some(outcome.checksum.as_str()));
 
     cleanup(&pool, &entity_id).await;

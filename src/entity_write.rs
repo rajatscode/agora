@@ -25,10 +25,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use thiserror::Error;
 
 use crate::mutation_log::{
-    self, MutationRecord, ACTOR_CLI, ACTOR_HTTP_HANDLER, OP_CREATE, OP_UPDATE,
+    self, MutationRecord, ACTOR_CLI, ACTOR_HTTP_HANDLER, OP_CREATE, OP_DENY_ATTEMPT, OP_UPDATE,
 };
+use crate::policy::{self, PolicyDecision, PolicyTuple, RELATION_OWNER};
+use crate::seed::ConceptCard;
 
 pub const TYPE_BANK_INTEGRATION: &str = "core.integrations.BankIntegration";
 pub const TYPE_AUTHENTICATION_METHOD: &str = "core.integrations.AuthenticationMethod";
@@ -119,19 +122,127 @@ pub fn project_account(entity_id: &str, email: Option<&str>, display_name: Optio
     })
 }
 
+/// Authoring intent + F5 outcome carriers.
+
+/// F5: Policy denial. `entity_write` returns this as a typed error so the
+/// HTTP layer can map it to 403 (with the structured trace) without losing
+/// the per-tuple detail to a `format!()` string.
+#[derive(Debug, Error)]
+#[error("policy_denied: {reason}")]
+pub struct PolicyDeniedError {
+    pub actor: String,
+    pub relation: String,
+    pub object: String,
+    pub reason: String,
+    pub considered: Vec<PolicyTuple>,
+    /// The mutation_log row recording the denial attempt. Present iff the
+    /// denial was successfully logged (the audit trail is independent from
+    /// whether the entity row landed).
+    pub logged_seq: Option<i64>,
+}
+
 /// Apply a CreateBankIntegration mutation: atomic INSERT + log.
 ///
 /// Used by both the CLI (`agora write bank-integration ...`) and the future
 /// HTTP handler. The ontology_version is a parameter, not a constant — the
 /// caller (router/registry) decides which version a given write was authored
 /// under, mirroring DEMO.md Beat 7's "ontology_version: 2" claim.
+///
+/// F5: backward-compatible alias of `apply_create_bank_integration_authzed`
+/// that wires the historical actor (HTTP handler / CLI) up to the policy
+/// evaluator as `team:integrations-platform`. New code should call the
+/// authzed variant directly.
 pub async fn apply_create_bank_integration(
     pool: &sqlx::PgPool,
     cmd: &CreateBankIntegrationCmd,
     ontology_version: i32,
     origin: WriteOrigin,
 ) -> Result<WriteOutcome> {
+    apply_create_bank_integration_authzed(
+        pool,
+        cmd,
+        ontology_version,
+        origin,
+        "team:integrations-platform",
+        None,
+    )
+    .await
+    .map_err(|e| match e {
+        WriteError::Other(err) => err,
+        // The legacy entry point can't surface PolicyDenied — it always
+        // injects the owner team. Anyone hitting this branch is a bug.
+        WriteError::PolicyDenied(d) => anyhow::anyhow!(
+            "legacy entry point should never see PolicyDenied: {}",
+            d.reason
+        ),
+    })
+}
+
+/// F5 error wrapper for the authzed write path. Lets the daemon
+/// distinguish "real failure" from "policy denied — return 403".
+#[derive(Debug)]
+pub enum WriteError {
+    PolicyDenied(PolicyDeniedError),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::PolicyDenied(d) => write!(f, "{d}"),
+            WriteError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+impl From<anyhow::Error> for WriteError {
+    fn from(e: anyhow::Error) -> Self {
+        WriteError::Other(e)
+    }
+}
+
+/// F5 entrypoint — same write, plus policy evaluation against `actor`
+/// before the INSERT lands. `policy_card` is the ConceptCard for the
+/// target type; the policy spec is built from it via
+/// `policy::spec_for_concept`. Pass `None` to skip the policy check (used
+/// by tests that don't want to exercise authorization).
+pub async fn apply_create_bank_integration_authzed(
+    pool: &sqlx::PgPool,
+    cmd: &CreateBankIntegrationCmd,
+    ontology_version: i32,
+    origin: WriteOrigin,
+    actor: &str,
+    policy_card: Option<&ConceptCard>,
+) -> std::result::Result<WriteOutcome, WriteError> {
     let data = project_bank_integration(&cmd.entity_id, &cmd.provider);
+
+    // -------- F5: policy check --------
+    if let Some(card) = policy_card {
+        let spec = policy::spec_for_concept(card);
+        let object = policy::object_id("bank_integration", &cmd.entity_id);
+        let decision = policy::evaluate(&spec, actor, RELATION_OWNER, &object);
+        if let PolicyDecision::Deny { reason, considered } = decision {
+            // Log the denial attempt — auditable, separate from the entity
+            // table. The mutation_log row records the *attempted* payload so
+            // a reviewer can see what they tried to write.
+            let logged_seq =
+                log_deny_attempt(pool, &cmd.entity_id, &data, ontology_version, actor, &reason)
+                    .await
+                    .map_err(WriteError::Other)?;
+            return Err(WriteError::PolicyDenied(PolicyDeniedError {
+                actor: actor.to_string(),
+                relation: RELATION_OWNER.to_string(),
+                object,
+                reason,
+                considered,
+                logged_seq: Some(logged_seq),
+            }));
+        }
+    }
+    // -------- /F5 --------
+
     let mut tx = pool.begin().await.context("begin bank_integration write")?;
 
     sqlx::query(
@@ -162,6 +273,10 @@ pub async fn apply_create_bank_integration(
         OP_CREATE
     };
 
+    // F5: prefer the caller-supplied actor (team:foo) over the generic
+    // origin actor when an actor was passed. This keeps the audit trail
+    // honest about *who* did the allowed write.
+    let logged_actor = if actor.is_empty() { origin.actor() } else { actor };
     let rec = mutation_log::log_mutation_in_tx(
         &mut tx,
         TYPE_BANK_INTEGRATION,
@@ -169,12 +284,39 @@ pub async fn apply_create_bank_integration(
         op,
         &data,
         ontology_version,
-        origin.actor(),
+        logged_actor,
     )
-    .await?;
+    .await
+    .map_err(WriteError::Other)?;
 
     tx.commit().await.context("commit bank_integration write")?;
     Ok(WriteOutcome::from(rec))
+}
+
+/// Insert a DenyAttempt mutation_log row in its own short transaction. The
+/// entity table is NOT touched. Returns the seq number for the trace.
+async fn log_deny_attempt(
+    pool: &sqlx::PgPool,
+    entity_id: &str,
+    attempted_payload: &Value,
+    ontology_version: i32,
+    actor: &str,
+    reason: &str,
+) -> Result<i64> {
+    let mut tx = pool.begin().await.context("begin deny-attempt log")?;
+    let rec = mutation_log::log_mutation_with_denial_in_tx(
+        &mut tx,
+        TYPE_BANK_INTEGRATION,
+        entity_id,
+        OP_DENY_ATTEMPT,
+        attempted_payload,
+        ontology_version,
+        actor,
+        Some(reason),
+    )
+    .await?;
+    tx.commit().await.context("commit deny-attempt log")?;
+    Ok(rec.seq)
 }
 
 #[cfg(test)]
