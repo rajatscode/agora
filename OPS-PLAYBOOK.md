@@ -8,6 +8,25 @@ Sidekick references: pre-demo checklist in `DEMO-RUNBOOK.md`; runtime rule in `R
 
 ---
 
+## LLM mode + quota (decide this BEFORE going live)
+
+**Default is offline.** The demo flow works **fully** without `ANTHROPIC_API_KEY`. Every author-mode pill renders `offline · no API key` honestly; Beat 6½ revision plans come from the deterministic heuristic. This is the safer demo posture and the mode all dry-runs have been validated against.
+
+**If the user wants live LLM for the judge run:**
+
+1. **Set the key in the daemon's environment, then restart.** The daemon caches mode at boot — exporting after launch is too late.
+   ```bash
+   kill $(lsof -ti:3030)
+   ANTHROPIC_API_KEY=sk-ant-... DATABASE_URL=postgres://localhost/agora_dev cargo run --bin agorad
+   ```
+2. **Check quota first.** Each full demo run makes **~2 Anthropic tool-use calls** (Beat 1 proposal author + Beat 6½ revise step). Practice runs eat the same budget. **Plan for 4–8 calls per session** (3 practice runs + 1 judge run is realistic).
+3. **Verify with one Beat 1 click.** If the proposal card's pill reads `live · LLM-derived`, you're good. If it reads `offline · API error`, check the key's permissions and tier before going on stage.
+4. **Mid-demo rate limit is non-fatal.** The pill flips to orange `offline · API error` and the offline fallback fires automatically. This is **by design, not a failure** — narrate it as such (see failure card #4 below).
+
+**Recommendation.** Run the demo in **offline mode** unless live-LLM is specifically required by the judges. Offline mode is faster, free, deterministic, and visibly honest. Live mode is the same architecture with slightly different latency and a non-zero API-error risk you have to monitor.
+
+---
+
 ## Pre-demo (90 seconds, do this before the camera is on)
 
 - Daemon running on the **latest** binary: `kill $(lsof -ti:3030) 2>/dev/null; cargo build --bin agorad && DATABASE_URL=postgres://localhost/agora_dev cargo run --bin agorad &`
