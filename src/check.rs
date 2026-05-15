@@ -54,7 +54,7 @@ pub async fn check(
     report.checks.push(axes::impact::run(proposal, catalog));
 
     tracing::info!("axis: data-conformance");
-    report.data_conformance = axes::data_conformance::run(proposal, db).await;
+    report.data_conformance = axes::data_conformance::run(proposal, catalog, db).await;
 
     tracing::info!("axis: replay");
     report.checks.push(axes::replay::run(proposal));
@@ -82,6 +82,6 @@ pub fn count_failures(report: &CheckReport) -> usize {
 }
 
 /// Lookup helper: returns the axis row by axis kind, if present.
-pub fn axis_row<'a>(report: &'a CheckReport, axis: Axis) -> Option<&'a crate::check_report::CheckRow> {
+pub fn axis_row(report: &CheckReport, axis: Axis) -> Option<&crate::check_report::CheckRow> {
     report.checks.iter().find(|r| r.axis == axis)
 }

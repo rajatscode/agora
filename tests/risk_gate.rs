@@ -146,6 +146,44 @@ async fn risky_path_blocks_when_db_unavailable() {
 }
 
 #[tokio::test]
+async fn sql_injection_field_name_does_not_execute() {
+    // Regression: deslop-f2 flagged that data-conformance interpolated the
+    // proposal's field_name into raw SQL. A malicious proposal that passes
+    // `email; DROP TABLE accounts; --` MUST be rejected before the query runs,
+    // both by the identifier validator AND by the catalog allowlist. We don't
+    // need a DB to assert this — the validator + catalog check fire first.
+    std::env::remove_var("ANTHROPIC_API_KEY");
+
+    let mut proposal = risky_tighten();
+    proposal.change = Change::TightenField {
+        type_ref: TypeRef {
+            namespace: "core.users".into(),
+            name: "Account".into(),
+        },
+        field_name: "email; DROP TABLE accounts; --".into(),
+        from_required: false,
+        to_required: true,
+    };
+
+    let catalog = seed::baseline_concepts();
+    let report = check::check(&proposal, &catalog, None).await.expect("check");
+
+    // The proposal is blocked, no matter the path (composition or DC).
+    assert_eq!(report.status, "blocked");
+    assert!(!report.auto_approval_eligible);
+
+    // Data-conformance specifically must be Skipped with a refusal reason —
+    // never Fail (would imply we ran the query), never Pass (would imply we
+    // ran the query and got zero), never Outcome::Skipped with the source
+    // "postgres" (would imply we asked the DB about the malicious column).
+    let dc = &report.data_conformance;
+    assert!(matches!(dc.outcome, Outcome::Skipped));
+    assert!(dc.source.contains("not a valid identifier")
+            || dc.source.contains("not present on"));
+    assert_ne!(dc.source, "postgres");
+}
+
+#[tokio::test]
 async fn report_is_valid_json() {
     std::env::remove_var("ANTHROPIC_API_KEY");
     let proposal = happy_additive();

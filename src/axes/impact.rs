@@ -53,9 +53,19 @@ pub fn run(proposal: &OntologyChangeProposal, catalog: &[ConceptCard]) -> CheckR
         referenced_by.len()
     );
 
+    // Pass when nothing in the catalog references the target (no blast radius
+    // to surface). Otherwise Advisory so reviewers see the downstream list
+    // even if it doesn't block. Impact is never a Fail by design — it's
+    // informational, not a gate.
+    let outcome = if referenced_by.is_empty() {
+        Outcome::Pass
+    } else {
+        Outcome::Advisory
+    };
+
     CheckRow {
         axis: Axis::Impact,
-        outcome: Outcome::Advisory,
+        outcome,
         findings,
         evidence: json!({
             "target_fqn": target_fqn,

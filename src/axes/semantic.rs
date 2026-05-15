@@ -55,7 +55,7 @@ pub async fn run(proposal: &OntologyChangeProposal, catalog: &[ConceptCard]) -> 
 
     match api_key {
         Some(key) if !key.is_empty() => match call_anthropic(&key, proposal, catalog).await {
-            Ok(verdict) => row_from_verdict(verdict, started, upstream_offline, /*live=*/ true),
+            Ok(verdict) => row_from_live_verdict(verdict, started, upstream_offline),
             Err(e) => {
                 tracing::warn!("Semantic LLM call failed: {e}; falling back to deterministic verdict");
                 fallback_row(proposal, started, format!("anthropic-error: {e}"))
@@ -70,11 +70,12 @@ fn is_upstream_offline(model: &str) -> bool {
     m.starts_with("offline-") || m.contains("heuristic")
 }
 
-fn row_from_verdict(
+/// Build a CheckRow from a verdict the live Anthropic call produced.
+/// The offline fallback path goes through `fallback_row` instead.
+fn row_from_live_verdict(
     v: SemanticVerdict,
     started: Instant,
     upstream_offline: bool,
-    live_call: bool,
 ) -> CheckRow {
     let cls = v.classification.to_lowercase();
     let outcome = match cls.as_str() {
@@ -91,17 +92,11 @@ fn row_from_verdict(
 
     let confidence = if upstream_offline {
         Confidence::Low
-    } else if live_call {
-        Confidence::High
     } else {
-        Confidence::Low
+        Confidence::High
     };
 
-    let source = if live_call {
-        format!("anthropic:{}", SEMANTIC_MODEL)
-    } else {
-        "offline-fallback".into()
-    };
+    let source = format!("anthropic:{}", SEMANTIC_MODEL);
 
     let upstream_note = if upstream_offline {
         " (upstream proposal was authored offline; verdict downgraded to low-confidence)"
