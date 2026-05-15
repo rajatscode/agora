@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::PgConnection;
 
 /// Embedded SQL — kept inline so `cargo run` works without any external
 /// migration tooling. If we later switch to sqlx-cli these are the same
@@ -57,52 +58,70 @@ pub async fn connect_optional(database_url: Option<&str>) -> Result<Option<PgPoo
 /// Without it, parallel test runs (each calling `migrate()` against the
 /// same DB) deadlock on the seed `INSERT … ON CONFLICT DO NOTHING`
 /// statements: row-level locks acquired by competing inserts can form a
-/// cycle even when the final outcome is a no-op. The advisory lock takes
-/// O(ms) and is released on session/connection drop, so this is harmless
-/// for the CLI and decisive for the test suite.
+/// cycle even when the final outcome is a no-op.
+///
+/// **Connection pinning is load-bearing.** `pg_advisory_lock` is session-
+/// scoped: the lock lives on the *connection* that ran `SELECT
+/// pg_advisory_lock($1)` and is released only when that session ends OR
+/// the same session calls `pg_advisory_unlock`. If we ran the lock on the
+/// pool (`.execute(pool)`), sqlx would check out a connection per call;
+/// the lock would acquire on connection X, the migrations might (or might
+/// not) run on X, and the unlock could land on connection Y where it
+/// silently no-ops — leaking the lock until X drops naturally. In a CI
+/// or live-demo environment where pool churn / idle eviction is real,
+/// that becomes a tail-latency / hung-startup hazard.
+///
+/// Fix: acquire **one** connection up front, run lock+migrations+unlock
+/// all against `&mut *conn`, drop the connection on return.
 ///
 /// The magic number is just an app-specific identifier — pg_advisory_lock
 /// keys are 64-bit ints in any namespace. `0xA607A` is "AGORA" in leet.
 const MIGRATION_LOCK_KEY: i64 = 0xA607A;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquiring migration connection")?;
+
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(MIGRATION_LOCK_KEY)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("acquiring migration advisory lock")?;
 
-    let result = run_migrations_locked(pool).await;
+    let result = run_migrations_locked_on_conn(&mut conn).await;
 
-    // Best-effort unlock; we don't promote an unlock error over a real
-    // migration error.
+    // Best-effort unlock on the SAME connection that holds the lock.
+    // Failure to unlock isn't promoted over a real migration error; the
+    // lock will be released anyway when `conn` drops at end-of-scope.
     let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(MIGRATION_LOCK_KEY)
-        .execute(pool)
+        .execute(&mut *conn)
         .await;
 
     result
 }
 
-async fn run_migrations_locked(pool: &PgPool) -> Result<()> {
+async fn run_migrations_locked_on_conn(conn: &mut PgConnection) -> Result<()> {
     sqlx::raw_sql(MIGRATION_001)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("running migrations/001_init.sql")?;
     sqlx::raw_sql(MIGRATION_002)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("running migrations/002_seed_accounts.sql")?;
     sqlx::raw_sql(MIGRATION_003)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("running migrations/003_mutation_log_checksum.sql")?;
     sqlx::raw_sql(MIGRATION_004)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("running migrations/004_policy_denial.sql")?;
     sqlx::raw_sql(MIGRATION_005)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .context("running migrations/005_customer_domain.sql")?;
     Ok(())
