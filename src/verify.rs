@@ -26,8 +26,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::entity_write::{
-    project_account, project_authentication_method, project_bank_integration, project_customer,
-    TYPE_ACCOUNT, TYPE_AUTHENTICATION_METHOD, TYPE_BANK_INTEGRATION, TYPE_CUSTOMER,
+    project_account, project_audit_finding, project_authentication_method,
+    project_bank_integration, project_customer, TYPE_ACCOUNT, TYPE_AUDIT_FINDING,
+    TYPE_AUTHENTICATION_METHOD, TYPE_BANK_INTEGRATION, TYPE_CUSTOMER,
 };
 use crate::mutation_log::{self, compute_checksum, LoggedMutation};
 
@@ -255,6 +256,43 @@ async fn collect_live_rows(pool: &PgPool) -> Result<Vec<LiveRow>> {
         });
     }
 
+    // F9: Compliance / GRC — iterate `audit_findings` the same way. Times
+    // are pulled as TIMESTAMPTZ and formatted back to RFC3339 to round-trip
+    // cleanly against `project_audit_finding`'s string fields.
+    let af: Vec<(
+        String,
+        String,
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, rule_id, severity, status, opened_at, resolved_at, notes
+         FROM audit_findings ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("reading audit_findings")?;
+    for (id, rule_id, severity, status, opened_at, resolved_at, notes) in af {
+        let opened = opened_at.to_rfc3339();
+        let resolved = resolved_at.map(|t| t.to_rfc3339());
+        let data = project_audit_finding(
+            &id,
+            &rule_id,
+            &severity,
+            &status,
+            &opened,
+            resolved.as_deref(),
+            notes.as_deref(),
+        );
+        out.push(LiveRow {
+            entity_type: TYPE_AUDIT_FINDING,
+            entity_id: id,
+            data,
+        });
+    }
+
     Ok(out)
 }
 
@@ -282,6 +320,10 @@ async fn latest_per_entity(
         // without this, every handler-written Customer would look
         // out-of-band because we'd never find its log row.
         TYPE_CUSTOMER.to_string(),
+        // F9: Compliance / GRC. Without this, handler-written
+        // AuditFindings would look out-of-band because their log rows
+        // would be invisible to the lookup.
+        TYPE_AUDIT_FINDING.to_string(),
     ][..])
     .fetch_all(pool)
     .await

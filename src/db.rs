@@ -21,6 +21,7 @@ const MIGRATION_002: &str = include_str!("../migrations/002_seed_accounts.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_mutation_log_checksum.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_policy_denial.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_customer_domain.sql");
+const MIGRATION_006: &str = include_str!("../migrations/006_compliance_domain.sql");
 
 /// Connect to Postgres. Returns Ok(None) if DATABASE_URL is unset OR the
 /// connection attempt fails — caller is expected to fall back to a
@@ -124,5 +125,9 @@ async fn run_migrations_locked_on_conn(conn: &mut PgConnection) -> Result<()> {
         .execute(&mut *conn)
         .await
         .context("running migrations/005_customer_domain.sql")?;
+    sqlx::raw_sql(MIGRATION_006)
+        .execute(&mut *conn)
+        .await
+        .context("running migrations/006_compliance_domain.sql")?;
     Ok(())
 }

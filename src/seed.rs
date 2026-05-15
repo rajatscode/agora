@@ -447,5 +447,215 @@ pub fn baseline_concepts() -> Vec<ConceptCard> {
                 doc: Some("Canonical user record.".into()),
             },
         },
+        // ====================================================================
+        // F9 — third domain: Compliance / GRC.
+        //
+        // Two concepts owned by `compliance-platform`. Same property F8
+        // exercised on Customer 360: same risk gate, agent loop, policy
+        // enforcement, explorer, and verify operate on Compliance without
+        // a line of domain-specific logic in agent.rs / check.rs (grep-
+        // verified at commit time).
+        //
+        // `AuditFinding.resolved_at` is intentionally OPTIONAL — the
+        // Beat-6-equivalent risky proposal "tighten resolved_at to
+        // required" exercises the data-conformance axis against the
+        // seeded rows whose findings are still open / under investigation.
+        // ====================================================================
+        ConceptCard {
+            fqn: "core.compliance.AuditFinding".into(),
+            summary: "audit finding compliance gdpr soc2 pci dss control \
+                      violation severity status incident remediation grc \
+                      regulatory review"
+                .into(),
+            spec: OntologyType {
+                namespace: "core.compliance".into(),
+                name: "AuditFinding".into(),
+                version: 1,
+                fields: vec![
+                    Field {
+                        name: "id".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 1,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some("Stable audit-finding id".into()),
+                    },
+                    Field {
+                        name: "rule_id".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 2,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some(
+                            "References the ComplianceRule that was violated."
+                                .into(),
+                        ),
+                    },
+                    Field {
+                        name: "severity".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 3,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some("'critical' | 'high' | 'medium' | 'low'.".into()),
+                    },
+                    Field {
+                        name: "status".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 4,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some(
+                            "'open' | 'investigating' | 'resolved' | 'accepted_risk'."
+                                .into(),
+                        ),
+                    },
+                    Field {
+                        name: "opened_at".into(),
+                        proto_type: ProtoType::Timestamp,
+                        proto_number: 5,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some("When the auditor first flagged this finding.".into()),
+                    },
+                    Field {
+                        name: "resolved_at".into(),
+                        proto_type: ProtoType::Timestamp,
+                        proto_number: 6,
+                        required: false,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some(
+                            "When the finding was closed out. NULL for open / \
+                             investigating findings — the risky proposal demonstrates \
+                             tightening this to required."
+                                .into(),
+                        ),
+                    },
+                    Field {
+                        name: "notes".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 7,
+                        required: false,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Pii,
+                        doc: Some(
+                            "Free-text remediation notes. Classified PII because \
+                             audit details often reference customer records."
+                                .into(),
+                        ),
+                    },
+                ],
+                relations: vec![],
+                invariants: vec![
+                    "Every AuditFinding has a non-empty `rule_id` matching an \
+                     active ComplianceRule."
+                        .into(),
+                    "`status = 'resolved'` requires `resolved_at` to be non-null."
+                        .into(),
+                    "`opened_at <= resolved_at` when both are set.".into(),
+                ],
+                ownership: Ownership {
+                    team: "compliance-platform".into(),
+                    semantic_steward: Some("core-ontology".into()),
+                },
+                policy_class: PolicyClass::Pii,
+                locality: Some("region".into()),
+                doc: Some(
+                    "Canonical audit-finding record for the Compliance / GRC \
+                     domain. Backs SOC2 / GDPR / PCI-DSS findings."
+                        .into(),
+                ),
+            },
+        },
+        ConceptCard {
+            fqn: "core.compliance.ComplianceRule".into(),
+            summary: "compliance rule policy soc2 gdpr pci dss hipaa control \
+                      framework regulatory active deprecated standard"
+                .into(),
+            spec: OntologyType {
+                namespace: "core.compliance".into(),
+                name: "ComplianceRule".into(),
+                version: 1,
+                fields: vec![
+                    Field {
+                        name: "rule_id".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 1,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Public,
+                        doc: Some("Stable rule identifier, e.g. 'SOC2-CC6.1'.".into()),
+                    },
+                    Field {
+                        name: "description".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 2,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Public,
+                        doc: Some("Human-readable description of the control.".into()),
+                    },
+                    Field {
+                        name: "regulatory_framework".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 3,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Public,
+                        doc: Some(
+                            "Which framework the rule comes from: 'SOC2' | 'GDPR' \
+                             | 'PCI-DSS' | 'HIPAA' | etc."
+                                .into(),
+                        ),
+                    },
+                    Field {
+                        name: "active".into(),
+                        proto_type: ProtoType::Bool,
+                        proto_number: 4,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Public,
+                        doc: Some(
+                            "False for rules that have been deprecated by their \
+                             framework owners."
+                                .into(),
+                        ),
+                    },
+                ],
+                relations: vec![],
+                invariants: vec![
+                    "`rule_id` is globally unique across all frameworks.".into(),
+                    "`regulatory_framework` is non-empty.".into(),
+                ],
+                ownership: Ownership {
+                    team: "compliance-platform".into(),
+                    semantic_steward: Some("core-ontology".into()),
+                },
+                policy_class: PolicyClass::Public,
+                locality: None,
+                doc: Some(
+                    "Canonical compliance-rule definition. Compliance / GRC \
+                     domain."
+                        .into(),
+                ),
+            },
+        },
     ]
 }

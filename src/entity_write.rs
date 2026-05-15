@@ -40,6 +40,10 @@ pub const TYPE_ACCOUNT: &str = "core.users.Account";
 /// `core.customer.*`; this constant is the FQN of the entity-table-backed
 /// concept, used by daemon dispatch + the policy evaluator.
 pub const TYPE_CUSTOMER: &str = "core.customer.Customer";
+/// F9: third-domain entity (Compliance / GRC). Same dispatch pattern as
+/// BankIntegration / Customer; the daemon routes POST /entities/AuditFinding
+/// through `apply_create_audit_finding_authzed`.
+pub const TYPE_AUDIT_FINDING: &str = "core.compliance.AuditFinding";
 
 /// Where the write came from. The daemon's handler picks `HttpHandler`;
 /// the `agora write` CLI picks `Cli`. Both end up in `mutation_log.actor`.
@@ -79,6 +83,24 @@ pub struct CreateCustomerCmd {
     pub display_name: Option<String>,
     #[serde(default)]
     pub signup_source: Option<String>,
+}
+
+/// F9: Inputs for the AuditFinding entity write. `resolved_at` and `notes`
+/// are optional — `resolved_at` tracks the open/investigating → resolved
+/// lifecycle, and the risky-tighten proposal targets that nullability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAuditFindingCmd {
+    pub entity_id: String,
+    pub rule_id: String,
+    pub severity: String,
+    pub status: String,
+    /// RFC3339 string when the finding was opened. The handler parses this
+    /// once into a chrono::DateTime; tests use a fixed value.
+    pub opened_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 /// What we return from a successful write. The HTTP layer renders this as
@@ -155,6 +177,35 @@ pub fn project_customer(
         "email":         email,
         "display_name":  display_name,
         "signup_source": signup_source,
+    })
+}
+
+/// F9: Canonical projection for the AuditFinding entity. Includes the
+/// status-tracking timestamps so a change to `resolved_at` shows up in
+/// the canonical-JSON checksum (and therefore in F3 verify drift output).
+/// Excludes `created_at` for the same reason as the other projections.
+///
+/// Timestamps are serialised as RFC3339 strings rather than chrono values
+/// so the projection is identical to what the seed migration would
+/// produce on read-back, and so the canonical_json serialiser doesn't have
+/// to special-case datetimes.
+pub fn project_audit_finding(
+    entity_id: &str,
+    rule_id: &str,
+    severity: &str,
+    status: &str,
+    opened_at: &str,
+    resolved_at: Option<&str>,
+    notes: Option<&str>,
+) -> Value {
+    json!({
+        "id":          entity_id,
+        "rule_id":     rule_id,
+        "severity":    severity,
+        "status":      status,
+        "opened_at":   opened_at,
+        "resolved_at": resolved_at,
+        "notes":       notes,
     })
 }
 
@@ -480,6 +531,147 @@ pub async fn apply_create_customer_authzed(
     .map_err(WriteError::Other)?;
 
     tx.commit().await.context("commit customer write")?;
+    Ok(WriteOutcome::from(rec))
+}
+
+// ============================================================================
+// F9 — third domain: Compliance / GRC entity writes.
+//
+// Structurally identical to apply_create_customer_authzed: same atomic
+// INSERT + log shape, same F5 policy check (different owner team), same
+// WriteError::PolicyDenied carrying full trace. The presence of three
+// uniform variants is the load-bearing proof of N-domain generalization
+// — daemon dispatch reads `type_name`, picks the apply_*, the rest is
+// identical control plane.
+// ============================================================================
+
+pub async fn apply_create_audit_finding_authzed(
+    pool: &sqlx::PgPool,
+    cmd: &CreateAuditFindingCmd,
+    ontology_version: i32,
+    origin: WriteOrigin,
+    actor: &str,
+    policy_card: Option<&ConceptCard>,
+) -> std::result::Result<WriteOutcome, WriteError> {
+    // Normalise the caller's RFC3339 timestamps through chrono so the
+    // projection logged here is byte-identical to what `verify()` will
+    // produce when it reads the TIMESTAMPTZ back and formats with
+    // `.to_rfc3339()`. Otherwise the caller's "...Z" suffix vs chrono's
+    // "...+00:00" would diverge → spurious drift.
+    let opened_dt: chrono::DateTime<chrono::Utc> = cmd
+        .opened_at
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .or_else(|_| cmd.opened_at.parse::<chrono::DateTime<chrono::Utc>>())
+        .map_err(|e| WriteError::Other(anyhow::anyhow!("invalid opened_at: {e}")))?;
+    let resolved_dt: Option<chrono::DateTime<chrono::Utc>> = match cmd.resolved_at.as_deref() {
+        None => None,
+        Some(s) => Some(
+            s.parse::<chrono::DateTime<chrono::FixedOffset>>()
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .or_else(|_| s.parse::<chrono::DateTime<chrono::Utc>>())
+                .map_err(|e| WriteError::Other(anyhow::anyhow!("invalid resolved_at: {e}")))?,
+        ),
+    };
+    let opened_canonical = opened_dt.to_rfc3339();
+    let resolved_canonical = resolved_dt.map(|d| d.to_rfc3339());
+
+    let data = project_audit_finding(
+        &cmd.entity_id,
+        &cmd.rule_id,
+        &cmd.severity,
+        &cmd.status,
+        &opened_canonical,
+        resolved_canonical.as_deref(),
+        cmd.notes.as_deref(),
+    );
+
+    // -------- F5 policy check (uniform across concepts) --------
+    if let Some(card) = policy_card {
+        let spec = policy::spec_for_concept(card);
+        let object = policy::object_id("audit_finding", &cmd.entity_id);
+        let decision = policy::evaluate(&spec, actor, RELATION_OWNER, &object);
+        if let PolicyDecision::Deny { reason, considered } = decision {
+            let logged_seq = log_deny_attempt_for(
+                pool,
+                TYPE_AUDIT_FINDING,
+                &cmd.entity_id,
+                &data,
+                ontology_version,
+                actor,
+                &reason,
+            )
+            .await
+            .map_err(WriteError::Other)?;
+            return Err(WriteError::PolicyDenied(PolicyDeniedError {
+                actor: actor.to_string(),
+                relation: RELATION_OWNER.to_string(),
+                object,
+                reason,
+                considered,
+                logged_seq: Some(logged_seq),
+            }));
+        }
+    }
+
+    let mut tx = pool.begin().await.context("begin audit_finding write")?;
+
+    // Bind the parsed DateTime values directly — sqlx maps
+    // chrono::DateTime<Utc> ↔ TIMESTAMPTZ natively. Going through
+    // canonical chrono on both write and verify is what makes the
+    // checksum stable across the round-trip.
+    sqlx::query(
+        "INSERT INTO audit_findings
+            (id, rule_id, severity, status, opened_at, resolved_at, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id) DO UPDATE SET
+            rule_id     = EXCLUDED.rule_id,
+            severity    = EXCLUDED.severity,
+            status      = EXCLUDED.status,
+            opened_at   = EXCLUDED.opened_at,
+            resolved_at = EXCLUDED.resolved_at,
+            notes       = EXCLUDED.notes",
+    )
+    .bind(&cmd.entity_id)
+    .bind(&cmd.rule_id)
+    .bind(&cmd.severity)
+    .bind(&cmd.status)
+    .bind(opened_dt)
+    .bind(resolved_dt)
+    .bind(&cmd.notes)
+    .execute(&mut *tx)
+    .await
+    .context("inserting audit_finding row")?;
+
+    let op = if sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM mutation_log WHERE type_id = $1 AND entity_id = $2",
+    )
+    .bind(TYPE_AUDIT_FINDING)
+    .bind(&cmd.entity_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("counting existing audit_finding mutation_log rows")?
+        > 0
+    {
+        OP_UPDATE
+    } else {
+        OP_CREATE
+    };
+
+    let logged_actor = if actor.is_empty() { origin.actor() } else { actor };
+    let rec = mutation_log::log_mutation_in_tx(
+        &mut tx,
+        TYPE_AUDIT_FINDING,
+        &cmd.entity_id,
+        op,
+        &data,
+        ontology_version,
+        logged_actor,
+    )
+    .await
+    .map_err(WriteError::Other)?;
+
+    tx.commit().await.context("commit audit_finding write")?;
     Ok(WriteOutcome::from(rec))
 }
 

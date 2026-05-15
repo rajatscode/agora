@@ -43,8 +43,8 @@ use crate::check;
 use crate::check_report::CheckReport;
 use crate::db;
 use crate::entity_write::{
-    self, CreateBankIntegrationCmd, CreateCustomerCmd, WriteOrigin, TYPE_BANK_INTEGRATION,
-    TYPE_CUSTOMER,
+    self, CreateAuditFindingCmd, CreateBankIntegrationCmd, CreateCustomerCmd, WriteOrigin,
+    TYPE_AUDIT_FINDING, TYPE_BANK_INTEGRATION, TYPE_CUSTOMER,
 };
 use crate::explorer;
 use crate::llm;
@@ -430,6 +430,22 @@ struct WriteEntityReq {
     display_name: Option<String>,
     #[serde(default)]
     signup_source: Option<String>,
+    // F9: Compliance / GRC fields. Only consumed when the dispatched
+    // type is AuditFinding. Required fields (`rule_id`, `severity`,
+    // `status`, `opened_at`) are explicitly required by the handler;
+    // `resolved_at` and `notes` are optional and Option<String>-shaped.
+    #[serde(default)]
+    rule_id: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    opened_at: Option<String>,
+    #[serde(default)]
+    resolved_at: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
 }
 
 fn default_ontology_version() -> i32 {
@@ -443,17 +459,19 @@ async fn write_entity(
 ) -> Result<Json<entity_write::WriteOutcome>, ApiError> {
     let pool = state.require_db()?;
 
-    // Accept either the bare PascalCase type ("BankIntegration", "Customer")
-    // or the fully-qualified name. Anything else → 400.
+    // Accept either the bare PascalCase type ("BankIntegration", "Customer",
+    // "AuditFinding") or the fully-qualified name. Anything else → 400.
     let resolved = match type_name.as_str() {
         "BankIntegration" | TYPE_BANK_INTEGRATION => TYPE_BANK_INTEGRATION,
         // F8: Customer 360 domain.
         "Customer" | TYPE_CUSTOMER => TYPE_CUSTOMER,
+        // F9: Compliance / GRC domain.
+        "AuditFinding" | TYPE_AUDIT_FINDING => TYPE_AUDIT_FINDING,
         other => {
             return Err(ApiError::bad_request(
                 "unsupported_entity_type",
                 format!(
-                    "unsupported entity type {other:?}; supported: BankIntegration, Customer"
+                    "unsupported entity type {other:?}; supported: BankIntegration, Customer, AuditFinding"
                 ),
             ));
         }
@@ -461,6 +479,58 @@ async fn write_entity(
 
     if req.entity_id.trim().is_empty() {
         return Err(ApiError::bad_request("missing_entity_id", "entity_id is required"));
+    }
+
+    // F9: AuditFinding dispatch — same shape as Customer, different policy
+    // card + apply_* function.
+    if resolved == TYPE_AUDIT_FINDING {
+        // Required-field validation. We surface 400s for missing required
+        // fields instead of letting Postgres reject the INSERT with a 500.
+        let rule_id = req.rule_id.clone().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            ApiError::bad_request("missing_rule_id", "rule_id is required for AuditFinding")
+        })?;
+        let severity = req.severity.clone().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            ApiError::bad_request("missing_severity", "severity is required for AuditFinding")
+        })?;
+        let status = req.status.clone().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            ApiError::bad_request("missing_status", "status is required for AuditFinding")
+        })?;
+        let opened_at = req.opened_at.clone().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+            ApiError::bad_request(
+                "missing_opened_at",
+                "opened_at (RFC3339) is required for AuditFinding",
+            )
+        })?;
+
+        let cmd = CreateAuditFindingCmd {
+            entity_id: req.entity_id,
+            rule_id,
+            severity,
+            status,
+            opened_at,
+            resolved_at: req.resolved_at.filter(|s| !s.trim().is_empty()),
+            notes: req.notes.filter(|s| !s.trim().is_empty()),
+        };
+        let actor = req
+            .actor
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("team:compliance-platform");
+        let policy_card = state.catalog.iter().find(|c| c.fqn == TYPE_AUDIT_FINDING);
+        let outcome = entity_write::apply_create_audit_finding_authzed(
+            pool,
+            &cmd,
+            req.ontology_version,
+            WriteOrigin::HttpHandler,
+            actor,
+            policy_card,
+        )
+        .await
+        .map_err(|e| match e {
+            entity_write::WriteError::PolicyDenied(denial) => ApiError::policy_denied(denial),
+            entity_write::WriteError::Other(err) => ApiError::internal("write_failed", err),
+        })?;
+        return Ok(Json(outcome));
     }
 
     // F8: Customer dispatch — same shape as BankIntegration, different

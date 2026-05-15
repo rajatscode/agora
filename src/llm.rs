@@ -489,7 +489,16 @@ fn guess_tighten_target(lower: &str) -> Option<(String, String, String)> {
                 && !lhs.is_empty()
                 && !rhs.is_empty()
             {
-                // Best guess at namespace.type
+                // Catalog lookup first: if any seed concept's terminal name
+                // case-insensitively matches `lhs`, prefer its real
+                // namespace + PascalCase name. This handles compound names
+                // like "AuditFinding" / "BankIntegration" that naïve
+                // pascal_case mishandles.
+                if let Some((ns, nm)) = lookup_concept_by_lowername(lhs) {
+                    return Some((ns, nm, rhs.to_string()));
+                }
+                // Fallback for tokens not in the seed catalog: best-guess
+                // namespace from lhs and naïve PascalCase.
                 let type_name = pascal_case(lhs);
                 let namespace = if lhs == "account" || lhs == "user" {
                     "core.users".into()
@@ -500,6 +509,25 @@ fn guess_tighten_target(lower: &str) -> Option<(String, String, String)> {
                 };
                 return Some((namespace, type_name, rhs.to_string()));
             }
+        }
+    }
+    None
+}
+
+/// Catalog lookup that doesn't require threading `catalog` through the
+/// heuristic-author call chain. Stays narrow on purpose — pulls the seed
+/// concept list once and case-insensitively matches the terminal name
+/// (`spec.name`). Returns `(namespace, name)` for the first match.
+///
+/// Why this is OK: `mock_proposal_from_prompt` is the offline fallback path;
+/// it already implicitly assumes the seed catalog. The real LLM path doesn't
+/// need this — Anthropic gets the catalog summary in the system prompt and
+/// emits the FQN directly.
+fn lookup_concept_by_lowername(lower_name: &str) -> Option<(String, String)> {
+    use crate::seed::baseline_concepts;
+    for card in baseline_concepts() {
+        if card.spec.name.to_lowercase() == lower_name {
+            return Some((card.spec.namespace.clone(), card.spec.name.clone()));
         }
     }
     None
@@ -1201,6 +1229,16 @@ fn heuristic_backfill_for(target_fqn: &str, field_name: &str) -> (String, String
             "synthetic_placeholder_from_id".into(),
             "lower(customers.id) || '@placeholder.invalid' for import-source rows".into(),
             "UPDATE customers SET email = lower(id) || '@placeholder.invalid' WHERE email IS NULL".into(),
+        ),
+        // F9: Compliance / GRC. Tightening `AuditFinding.resolved_at` to
+        // required would invalidate the open/investigating findings. The
+        // compliance team's M0 stance: rather than synthetic-fill, mark
+        // them as `accepted_risk` with `resolved_at = now()` so the
+        // invariant holds AND the status reflects the operational truth.
+        ("core.compliance.AuditFinding", "resolved_at") => (
+            "synthetic_accept_open_findings".into(),
+            "now() for findings still in status='open'/'investigating' (status promoted to accepted_risk)".into(),
+            "UPDATE audit_findings SET resolved_at = now(), status = 'accepted_risk' WHERE resolved_at IS NULL".into(),
         ),
         _ => (
             "default_to_placeholder".into(),
