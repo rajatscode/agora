@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::artifacts::{self, ArtifactManifest};
 use crate::ast::OntologyChangeProposal;
-use crate::llm;
+use crate::llm::{self, AuthorMode};
 use crate::reuse::{self, ReuseReport};
 use crate::seed;
 
@@ -59,6 +59,12 @@ pub struct ProposeArgs {
 
 #[derive(Debug, Serialize)]
 pub struct ProposeOutcome {
+    /// Where the proposal came from. `Live` = LLM-derived (so
+    /// `proposal.compatibility.semantic` is the LLM's verdict on the
+    /// semantic delta). Anything else = heuristic stand-in; downstream
+    /// consumers must NOT trust the compatibility classifications as
+    /// independent semantic checks.
+    pub author_mode: AuthorMode,
     pub proposal: OntologyChangeProposal,
     pub reuse: ReuseReport,
     pub artifacts: ArtifactManifest,
@@ -73,9 +79,20 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn run_propose(args: ProposeArgs) -> Result<()> {
     eprintln!("[agora] authoring proposal from: {:?}", args.prompt);
-    let proposal = llm::author_proposal(&args.prompt, &args.actor)
+    let (proposal, author_mode) = llm::author_proposal(&args.prompt, &args.actor)
         .await
         .context("authoring proposal")?;
+
+    // Loud, unmissable banner when offline — fig-leaf protection per Nemesis.
+    if !author_mode.is_live() {
+        eprintln!("[agora] ╔════════════════════════════════════════════════════════════╗");
+        eprintln!("[agora] ║  ⚠  AUTHOR MODE: {:42}  ║", author_mode.label());
+        eprintln!("[agora] ║  compatibility.* axes are heuristic stand-ins, NOT LLM-derived ║");
+        eprintln!("[agora] ║  downstream consumers should treat them as low-confidence  ║");
+        eprintln!("[agora] ╚════════════════════════════════════════════════════════════╝");
+    } else {
+        eprintln!("[agora]   author mode: live (LLM-derived compatibility classifications)");
+    }
     eprintln!(
         "[agora]   id={} target={} change_intent={:?}",
         proposal.id,
@@ -140,6 +157,7 @@ async fn run_propose(args: ProposeArgs) -> Result<()> {
     };
 
     let outcome = ProposeOutcome {
+        author_mode: author_mode.clone(),
         proposal,
         reuse: report,
         artifacts,
@@ -152,6 +170,7 @@ async fn run_propose(args: ProposeArgs) -> Result<()> {
         // Compact one-screen summary for humans / demo.
         println!();
         println!("┌─ Agora proposal authored ───────────────────────────────");
+        println!("│ author mode  : {}", outcome.author_mode.label());
         println!("│ id           : {}", outcome.proposal.id);
         println!("│ target       : {}", outcome.proposal.target().fqn());
         println!("│ change_intent: {}", outcome.proposal.change_intent);
@@ -165,6 +184,9 @@ async fn run_propose(args: ProposeArgs) -> Result<()> {
         println!("│ artifacts in : {}", outcome.artifacts.directory);
         if let Some(s) = &outcome.api_post_status {
             println!("│ api POST     : {}", s);
+        }
+        if !outcome.author_mode.is_live() {
+            println!("│ ⚠ NOTE      : compatibility.* are heuristic stand-ins (offline)");
         }
         println!("└─────────────────────────────────────────────────────────");
     }

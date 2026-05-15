@@ -27,12 +27,48 @@ use crate::ast::{
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Public entry. Calls Anthropic once and returns a fully-populated proposal.
-/// Falls back to a deterministic offline author when no API key is available.
+/// Where this proposal was authored. Surfaced loudly to stderr AND embedded
+/// in the outcome JSON so downstream workstreams (and demo audiences) cannot
+/// mistake an offline-heuristic proposal for an LLM-derived one.
+///
+/// Why this matters: in `Live` mode, `compatibility.semantic` is **derived
+/// by the LLM** from the proposal's meaning_before/meaning_after/invariants
+/// — that's what makes Proof 4's semantic axis non-theatrical. In any
+/// `Offline*` mode, those classifications are heuristic-defaults (additive
+/// across the board) and downstream consumers MUST treat them as
+/// low-confidence stand-ins.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorMode {
+    /// Anthropic structured-output call succeeded; semantic+compatibility
+    /// classifications are LLM-derived from semantic_contract.
+    Live,
+    /// `ANTHROPIC_API_KEY` was unset — never attempted the call.
+    OfflineNoKey,
+    /// Key present, call attempted, network/API error → fell back.
+    /// `error` carries a one-line summary for the demo.
+    OfflineApiError { error: String },
+}
+
+impl AuthorMode {
+    pub fn is_live(&self) -> bool {
+        matches!(self, AuthorMode::Live)
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            AuthorMode::Live => "live (LLM-derived)",
+            AuthorMode::OfflineNoKey => "OFFLINE (no API key)",
+            AuthorMode::OfflineApiError { .. } => "OFFLINE (API error)",
+        }
+    }
+}
+
+/// Public entry. Calls Anthropic once and returns a fully-populated proposal,
+/// plus an `AuthorMode` so callers can prominently flag offline runs.
 pub async fn author_proposal(
     user_prompt: &str,
     actor: &str,
-) -> Result<OntologyChangeProposal> {
+) -> Result<(OntologyChangeProposal, AuthorMode)> {
     let proposal_id = generate_proposal_id(user_prompt);
 
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -48,19 +84,23 @@ pub async fn author_proposal(
                     generated_at: Utc::now().to_rfc3339(),
                     trace_id: None,
                 };
-                return Ok(prop);
+                return Ok((prop, AuthorMode::Live));
             }
             Err(e) => {
+                let err_summary = format!("{e}");
                 tracing::warn!(
-                    "Anthropic call failed ({e}); falling back to offline heuristic author"
+                    "Anthropic call failed ({err_summary}); falling back to offline heuristic author"
                 );
+                let prop = mock_proposal_from_prompt(user_prompt, actor, proposal_id);
+                return Ok((prop, AuthorMode::OfflineApiError { error: err_summary }));
             }
         }
-    } else {
-        tracing::warn!("ANTHROPIC_API_KEY unset; using offline heuristic author");
     }
-
-    Ok(mock_proposal_from_prompt(user_prompt, actor, proposal_id))
+    tracing::warn!("ANTHROPIC_API_KEY unset; using offline heuristic author");
+    Ok((
+        mock_proposal_from_prompt(user_prompt, actor, proposal_id),
+        AuthorMode::OfflineNoKey,
+    ))
 }
 
 fn generate_proposal_id(seed: &str) -> String {

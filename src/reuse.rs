@@ -366,6 +366,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn offline_mode_is_visibly_flagged() {
+        // Regression: Nemesis flagged silent fallback as a demo-day fig-leaf.
+        // When no API key is set, author_proposal MUST return AuthorMode::OfflineNoKey
+        // and the proposal's provenance.model MUST identify the heuristic.
+        // Verifies the contract — banner rendering is integration-tested manually.
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        let (prop, mode) = crate::llm::author_proposal(
+            "users need biometric login",
+            "user://test",
+        )
+        .await
+        .expect("author");
+        assert_eq!(mode, crate::llm::AuthorMode::OfflineNoKey);
+        assert!(!mode.is_live());
+        assert_eq!(prop.provenance.model, "offline-heuristic-v0");
+    }
+
     #[test]
     fn semantic_contract_invariants_are_populated() {
         // Regression: validator caught that semantic_contract.invariants
