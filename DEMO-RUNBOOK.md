@@ -7,7 +7,7 @@ The on-stage script. Read this once before going live. Each beat tells you exact
 ## Pre-demo checklist (do this 5 minutes before)
 
 1. **Daemon up.** `curl localhost:3030/health` returns `{"db":"connected","status":"ok"}`. Note the PID — if it dies mid-demo, you'll need to `cargo run --bin agorad` again.
-2. **Baselines correct.** `psql postgres://localhost/agora_dev -c "SELECT (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts) AS account_nulls, (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM customers) AS customer_nulls, (SELECT COUNT(*) FILTER (WHERE resolved_at IS NULL) FROM audit_findings) AS af_unresolved;"` must show **47 / 5 / 5** (Beat 6 / Customer agent loop / AuditFinding agent loop hero numbers).
+2. **Baselines correct.** `psql postgres://localhost/agora_dev -c "SELECT (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts) AS account_nulls, (SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM customers) AS customer_nulls, (SELECT COUNT(*) FILTER (WHERE resolved_at IS NULL) FROM audit_findings) AS af_unresolved;"` must show **47 / 5 / 4** (Beat 6 / Customer agent loop / AuditFinding agent loop hero numbers — fresh-DB seed values; ignore prior writes by running `curl -X POST /admin/reset` first to restore baselines).
 3. **Browser ready.** Fresh tab on `http://localhost:3030/`. Confirm you see all nine section headers: `01 / 02`, `03`, `05`, `06`, `06½`, `07`, `08` plus the intro card.
 4. **Console clean.** Open devtools briefly — no exceptions on page load (tab-switch fix landed in F4).
 5. **Have one DB query in your pocket.** `SELECT COUNT(*) FILTER (WHERE email IS NULL) FROM accounts;` — if a judge asks "is the 47 real?", run it live in a second terminal.
