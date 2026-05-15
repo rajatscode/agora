@@ -23,6 +23,21 @@ const MIGRATION_004: &str = include_str!("../migrations/004_policy_denial.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_customer_domain.sql");
 const MIGRATION_006: &str = include_str!("../migrations/006_compliance_domain.sql");
 
+/// Seed SQL bundle for `POST /admin/reset` — the data-restoring subset
+/// of the migrations, exposed so the demo's reset handler can re-seed
+/// without calling `migrate()` (which acquires a connection and holds it
+/// across multiple internal awaits; that compounds with the outer
+/// handler future and trips Axum's Handler Send-bound).
+///
+/// All four sub-migrations are idempotent (`ON CONFLICT DO NOTHING`).
+pub const SEED_BUNDLE: &str = concat!(
+    include_str!("../migrations/002_seed_accounts.sql"),
+    "\n",
+    include_str!("../migrations/005_customer_domain.sql"),
+    "\n",
+    include_str!("../migrations/006_compliance_domain.sql"),
+);
+
 /// Connect to Postgres. Returns Ok(None) if DATABASE_URL is unset OR the
 /// connection attempt fails — caller is expected to fall back to a
 /// "skipped: no DB" verdict on data-conformance.
