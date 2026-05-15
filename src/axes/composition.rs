@@ -25,7 +25,14 @@ pub fn run(proposal: &OntologyChangeProposal, catalog: &[ConceptCard]) -> CheckR
 
     match &proposal.change {
         Change::AddRelation { relation } => {
+            let from_fqn = relation.from.fqn();
             let to_fqn = relation.to.fqn();
+            if !catalog.iter().any(|c| c.fqn == from_fqn) {
+                issues.push(format!(
+                    "Relation source `{}` not present in registry catalog.",
+                    from_fqn
+                ));
+            }
             if !catalog.iter().any(|c| c.fqn == to_fqn) {
                 issues.push(format!(
                     "Relation target `{}` not present in registry catalog.",
@@ -73,12 +80,21 @@ pub fn run(proposal: &OntologyChangeProposal, catalog: &[ConceptCard]) -> CheckR
             }
         }
         Change::AddField { field, .. } => {
-            if let Some(card) = target_card {
-                if card.spec.fields.iter().any(|f| f.name == field.name) {
-                    issues.push(format!(
-                        "Field `{}` already exists on `{}`; should use TightenField or rename.",
-                        field.name, target
-                    ));
+            match target_card {
+                // Target concept must exist — adding a field to a phantom
+                // concept is exactly the "agora waves through `core.fake.Foo`"
+                // failure mode that erodes the canonical-concepts story.
+                None => issues.push(format!(
+                    "Target concept `{}` not in catalog; cannot add a field to a non-existent type.",
+                    target
+                )),
+                Some(card) => {
+                    if card.spec.fields.iter().any(|f| f.name == field.name) {
+                        issues.push(format!(
+                            "Field `{}` already exists on `{}`; should use TightenField or rename.",
+                            field.name, target
+                        ));
+                    }
                 }
             }
         }

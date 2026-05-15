@@ -184,6 +184,48 @@ async fn sql_injection_field_name_does_not_execute() {
 }
 
 #[tokio::test]
+async fn add_field_against_phantom_concept_fails_composition() {
+    // val-f2 regression: add_field against a non-catalog concept used to
+    // silently pass composition. The "canonical concepts" story collapses
+    // if Agora waves through a field on `core.fake.NotARealConceptXYZ`.
+    std::env::remove_var("ANTHROPIC_API_KEY");
+
+    let mut p = happy_additive();
+    p.change = Change::AddField {
+        type_ref: TypeRef {
+            namespace: "core.fake".into(),
+            name: "NotARealConceptXYZ".into(),
+        },
+        field: Field {
+            name: "made_up_flag".into(),
+            proto_type: ProtoType::Bool,
+            proto_number: 9,
+            required: false,
+            since_version: 1,
+            deprecated_in: None,
+            classification: PolicyClass::Internal,
+            doc: None,
+        },
+    };
+
+    let catalog = seed::baseline_concepts();
+    let report = check::check(&p, &catalog, None).await.expect("check");
+
+    assert_eq!(report.status, "blocked", "{:?}", report);
+    let comp = report
+        .checks
+        .iter()
+        .find(|r| r.axis == agora::check_report::Axis::Composition)
+        .expect("composition row present");
+    assert!(matches!(comp.outcome, Outcome::Fail));
+    assert!(
+        comp.findings.contains("not in catalog"),
+        "expected `not in catalog` in composition findings; got: {}",
+        comp.findings
+    );
+}
+
+#[tokio::test]
 async fn report_is_valid_json() {
     std::env::remove_var("ANTHROPIC_API_KEY");
     let proposal = happy_additive();
