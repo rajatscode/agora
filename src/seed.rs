@@ -181,6 +181,232 @@ pub fn baseline_concepts() -> Vec<ConceptCard> {
                 doc: Some("Canonical customer account record.".into()),
             },
         },
+        // ====================================================================
+        // F8 — second domain: Customer 360.
+        //
+        // Three concepts owned by `customer-platform` (Customer, LoyaltyTier)
+        // and `analytics-platform` (PurchaseHistory). They exist to prove
+        // Agora's plumbing is domain-generic — the same risk gate, agent loop,
+        // policy enforcement, and explorer all work against these without a
+        // line of domain-specific code in `agent.rs` / `check.rs` / `verify.rs`.
+        //
+        // Customer.email is intentionally OPTIONAL (mirroring Account.email)
+        // so a Beat-6-style "tighten Customer.email to required" proposal can
+        // be driven through the data-conformance axis against the seeded
+        // `customers` table (migrations/005). 5 of the 20 seeded rows carry
+        // NULL email so the violation count is real.
+        // ====================================================================
+        ConceptCard {
+            fqn: "core.customer.Customer".into(),
+            summary: "customer 360 profile email contact loyalty signup source \
+                      crm marketing identity holder retail consumer"
+                .into(),
+            spec: OntologyType {
+                namespace: "core.customer".into(),
+                name: "Customer".into(),
+                version: 1,
+                fields: vec![
+                    Field {
+                        name: "id".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 1,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some("Stable customer id".into()),
+                    },
+                    Field {
+                        name: "email".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 2,
+                        required: false,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Pii,
+                        doc: Some(
+                            "Contact email. Optional today; the second risky \
+                             proposal demonstrates tightening this to required."
+                                .into(),
+                        ),
+                    },
+                    Field {
+                        name: "display_name".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 3,
+                        required: false,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Pii,
+                        doc: Some("Human-readable name for CRM displays.".into()),
+                    },
+                    Field {
+                        name: "signup_source".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 4,
+                        required: false,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some(
+                            "Where this customer came from: 'web' | 'app' | \
+                             'partner' | 'import'."
+                                .into(),
+                        ),
+                    },
+                ],
+                relations: vec![],
+                invariants: vec![
+                    "Every Customer has a stable `id`.".into(),
+                    "If `email` is set it is unique within the customers table."
+                        .into(),
+                ],
+                ownership: Ownership {
+                    team: "customer-platform".into(),
+                    semantic_steward: Some("core-ontology".into()),
+                },
+                policy_class: PolicyClass::Pii,
+                locality: Some("region".into()),
+                doc: Some(
+                    "Canonical customer record for the Customer 360 domain."
+                        .into(),
+                ),
+            },
+        },
+        ConceptCard {
+            fqn: "core.customer.LoyaltyTier".into(),
+            summary: "loyalty tier rewards discount membership level customer \
+                      gold silver bronze platinum"
+                .into(),
+            spec: OntologyType {
+                namespace: "core.customer".into(),
+                name: "LoyaltyTier".into(),
+                version: 1,
+                fields: vec![
+                    Field {
+                        name: "tier_name".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 1,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Public,
+                        doc: Some("e.g. 'gold' | 'silver' | 'bronze'.".into()),
+                    },
+                    Field {
+                        name: "discount_pct".into(),
+                        proto_type: ProtoType::Int64,
+                        proto_number: 2,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Public,
+                        doc: Some(
+                            "Whole-number percentage discount (0..=100) applied \
+                             to a Customer's eligible purchases."
+                                .into(),
+                        ),
+                    },
+                ],
+                relations: vec![],
+                invariants: vec![
+                    "`discount_pct` is bounded by 0..=100.".into(),
+                    "`tier_name` is unique across LoyaltyTier rows.".into(),
+                ],
+                ownership: Ownership {
+                    team: "customer-platform".into(),
+                    semantic_steward: Some("core-ontology".into()),
+                },
+                policy_class: PolicyClass::Public,
+                locality: None,
+                doc: Some(
+                    "Canonical loyalty-tier definition. Customer 360 domain."
+                        .into(),
+                ),
+            },
+        },
+        ConceptCard {
+            fqn: "core.customer.PurchaseHistory".into(),
+            summary: "purchase history transaction order amount cents customer \
+                      analytics revenue order log buy retail"
+                .into(),
+            spec: OntologyType {
+                namespace: "core.customer".into(),
+                name: "PurchaseHistory".into(),
+                version: 1,
+                fields: vec![
+                    Field {
+                        name: "id".into(),
+                        proto_type: ProtoType::String,
+                        proto_number: 1,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some("Stable purchase-event id.".into()),
+                    },
+                    Field {
+                        name: "customer_id".into(),
+                        proto_type: ProtoType::Ref(
+                            "core.customer.Customer".into(),
+                        ),
+                        proto_number: 2,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some(
+                            "References Customer.id; orphans are illegal.".into(),
+                        ),
+                    },
+                    Field {
+                        name: "amount_cents".into(),
+                        proto_type: ProtoType::Int64,
+                        proto_number: 3,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Sensitive,
+                        doc: Some(
+                            "Purchase amount in cents (no currency conversion at \
+                             this layer)."
+                                .into(),
+                        ),
+                    },
+                    Field {
+                        name: "occurred_at".into(),
+                        proto_type: ProtoType::Timestamp,
+                        proto_number: 4,
+                        required: true,
+                        since_version: 1,
+                        deprecated_in: None,
+                        classification: PolicyClass::Internal,
+                        doc: Some(
+                            "Wall-clock time of the purchase, server-recorded.".into(),
+                        ),
+                    },
+                ],
+                relations: vec![],
+                invariants: vec![
+                    "`customer_id` must reference an existing Customer row."
+                        .into(),
+                    "`amount_cents` is non-negative.".into(),
+                    "`occurred_at` is monotonically increasing per customer_id."
+                        .into(),
+                ],
+                ownership: Ownership {
+                    team: "analytics-platform".into(),
+                    semantic_steward: Some("core-ontology".into()),
+                },
+                policy_class: PolicyClass::Sensitive,
+                locality: Some("region".into()),
+                doc: Some(
+                    "Per-customer purchase-event ledger; consumed by the \
+                     analytics domain to compute CLV/CAC."
+                        .into(),
+                ),
+            },
+        },
         ConceptCard {
             fqn: "core.users.User".into(),
             summary: "user account person profile identity email name customer".into(),

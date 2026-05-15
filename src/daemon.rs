@@ -42,7 +42,10 @@ use crate::ast::OntologyChangeProposal;
 use crate::check;
 use crate::check_report::CheckReport;
 use crate::db;
-use crate::entity_write::{self, CreateBankIntegrationCmd, WriteOrigin, TYPE_BANK_INTEGRATION};
+use crate::entity_write::{
+    self, CreateBankIntegrationCmd, CreateCustomerCmd, WriteOrigin, TYPE_BANK_INTEGRATION,
+    TYPE_CUSTOMER,
+};
 use crate::explorer;
 use crate::llm;
 use crate::seed::{self, ConceptCard};
@@ -419,6 +422,14 @@ struct WriteEntityReq {
     /// (e.g. existing daemon_http.rs test) keep working without changes.
     #[serde(default)]
     actor: Option<String>,
+    // F8: Customer 360 fields. Optional on purpose — see CreateCustomerCmd.
+    // Only consumed when the dispatched type is Customer.
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    signup_source: Option<String>,
 }
 
 fn default_ontology_version() -> i32 {
@@ -432,16 +443,17 @@ async fn write_entity(
 ) -> Result<Json<entity_write::WriteOutcome>, ApiError> {
     let pool = state.require_db()?;
 
-    // Accept either the bare PascalCase type ("BankIntegration") or the
-    // fully-qualified name ("core.integrations.BankIntegration"). Anything
-    // else is a 400 with the supported set listed.
+    // Accept either the bare PascalCase type ("BankIntegration", "Customer")
+    // or the fully-qualified name. Anything else → 400.
     let resolved = match type_name.as_str() {
         "BankIntegration" | TYPE_BANK_INTEGRATION => TYPE_BANK_INTEGRATION,
+        // F8: Customer 360 domain.
+        "Customer" | TYPE_CUSTOMER => TYPE_CUSTOMER,
         other => {
             return Err(ApiError::bad_request(
                 "unsupported_entity_type",
                 format!(
-                    "unsupported entity type {other:?}; supported: BankIntegration"
+                    "unsupported entity type {other:?}; supported: BankIntegration, Customer"
                 ),
             ));
         }
@@ -449,6 +461,38 @@ async fn write_entity(
 
     if req.entity_id.trim().is_empty() {
         return Err(ApiError::bad_request("missing_entity_id", "entity_id is required"));
+    }
+
+    // F8: Customer dispatch — same shape as BankIntegration, different
+    // policy card + apply_* function. The agent loop / risk gate / verify
+    // don't have to know which branch was taken.
+    if resolved == TYPE_CUSTOMER {
+        let cmd = CreateCustomerCmd {
+            entity_id: req.entity_id,
+            email: req.email.filter(|s| !s.trim().is_empty()),
+            display_name: req.display_name.filter(|s| !s.trim().is_empty()),
+            signup_source: req.signup_source.filter(|s| !s.trim().is_empty()),
+        };
+        let actor = req
+            .actor
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("team:customer-platform");
+        let policy_card = state.catalog.iter().find(|c| c.fqn == TYPE_CUSTOMER);
+        let outcome = entity_write::apply_create_customer_authzed(
+            pool,
+            &cmd,
+            req.ontology_version,
+            WriteOrigin::HttpHandler,
+            actor,
+            policy_card,
+        )
+        .await
+        .map_err(|e| match e {
+            entity_write::WriteError::PolicyDenied(denial) => ApiError::policy_denied(denial),
+            entity_write::WriteError::Other(err) => ApiError::internal("write_failed", err),
+        })?;
+        return Ok(Json(outcome));
     }
 
     if resolved == TYPE_BANK_INTEGRATION {

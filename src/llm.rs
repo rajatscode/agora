@@ -1193,6 +1193,15 @@ fn heuristic_backfill_for(target_fqn: &str, field_name: &str) -> (String, String
             "users.email WHERE users.account_id = accounts.id, else '<unknown>@placeholder.invalid'".into(),
             "UPDATE accounts a SET email = COALESCE((SELECT u.email FROM users u WHERE u.account_id = a.id), '<unknown>@placeholder.invalid') WHERE a.email IS NULL".into(),
         ),
+        // F8: Customer 360 — the import-source rows that arrived without
+        // emails get a synthetic placeholder so the tightening lands safely.
+        // The lifecycle team can rerun a "real" backfill against their CRM
+        // export later; this just satisfies the new invariant.
+        ("core.customer.Customer", "email") => (
+            "synthetic_placeholder_from_id".into(),
+            "lower(customers.id) || '@placeholder.invalid' for import-source rows".into(),
+            "UPDATE customers SET email = lower(id) || '@placeholder.invalid' WHERE email IS NULL".into(),
+        ),
         _ => (
             "default_to_placeholder".into(),
             format!("constant: '<unknown>' for {}.{}", target_fqn, field_name),

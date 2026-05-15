@@ -31,6 +31,10 @@ fn map_table(target: &TypeRef) -> Option<&'static str> {
         "core.users.Account" => Some("accounts"),
         "core.integrations.BankIntegration" => Some("bank_integrations"),
         "core.integrations.AuthenticationMethod" => Some("authentication_methods"),
+        // F8: Customer 360 domain. The "tighten Customer.email to required"
+        // proposal lands here just like the Account one — same axis, same
+        // SQL, different table. No domain-specific code in this axis.
+        "core.customer.Customer" => Some("customers"),
         _ => None,
     }
 }

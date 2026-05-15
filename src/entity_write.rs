@@ -36,6 +36,10 @@ use crate::seed::ConceptCard;
 pub const TYPE_BANK_INTEGRATION: &str = "core.integrations.BankIntegration";
 pub const TYPE_AUTHENTICATION_METHOD: &str = "core.integrations.AuthenticationMethod";
 pub const TYPE_ACCOUNT: &str = "core.users.Account";
+/// F8: second domain entity. The Customer 360 ontology lives under
+/// `core.customer.*`; this constant is the FQN of the entity-table-backed
+/// concept, used by daemon dispatch + the policy evaluator.
+pub const TYPE_CUSTOMER: &str = "core.customer.Customer";
 
 /// Where the write came from. The daemon's handler picks `HttpHandler`;
 /// the `agora write` CLI picks `Cli`. Both end up in `mutation_log.actor`.
@@ -60,6 +64,21 @@ impl WriteOrigin {
 pub struct CreateBankIntegrationCmd {
     pub entity_id: String,
     pub provider: String,
+}
+
+/// F8: Inputs for the Customer 360 entity write. `email` and `display_name`
+/// are optional on purpose — the same nullability the seed catalog declares
+/// (and the same nullability the risky "tighten email to required" proposal
+/// is designed to test against).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCustomerCmd {
+    pub entity_id: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub signup_source: Option<String>,
 }
 
 /// What we return from a successful write. The HTTP layer renders this as
@@ -119,6 +138,23 @@ pub fn project_account(entity_id: &str, email: Option<&str>, display_name: Optio
         "id": entity_id,
         "email": email,
         "display_name": display_name,
+    })
+}
+
+/// F8: Canonical projection for the Customer entity. Same rules as
+/// `project_bank_integration`: include identity + semantic fields, exclude
+/// server-set wallclock columns (`created_at`).
+pub fn project_customer(
+    entity_id: &str,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    signup_source: Option<&str>,
+) -> Value {
+    json!({
+        "id":            entity_id,
+        "email":         email,
+        "display_name":  display_name,
+        "signup_source": signup_source,
     })
 }
 
@@ -295,8 +331,13 @@ pub async fn apply_create_bank_integration_authzed(
 
 /// Insert a DenyAttempt mutation_log row in its own short transaction. The
 /// entity table is NOT touched. Returns the seq number for the trace.
-async fn log_deny_attempt(
+///
+/// F8: generalized — accepts the target `type_id` so the same helper logs
+/// denials for any concept (BankIntegration, Customer, etc.). The legacy
+/// helper below preserves the old call-site signature.
+async fn log_deny_attempt_for(
     pool: &sqlx::PgPool,
+    type_id: &str,
     entity_id: &str,
     attempted_payload: &Value,
     ontology_version: i32,
@@ -306,7 +347,7 @@ async fn log_deny_attempt(
     let mut tx = pool.begin().await.context("begin deny-attempt log")?;
     let rec = mutation_log::log_mutation_with_denial_in_tx(
         &mut tx,
-        TYPE_BANK_INTEGRATION,
+        type_id,
         entity_id,
         OP_DENY_ATTEMPT,
         attempted_payload,
@@ -317,6 +358,129 @@ async fn log_deny_attempt(
     .await?;
     tx.commit().await.context("commit deny-attempt log")?;
     Ok(rec.seq)
+}
+
+async fn log_deny_attempt(
+    pool: &sqlx::PgPool,
+    entity_id: &str,
+    attempted_payload: &Value,
+    ontology_version: i32,
+    actor: &str,
+    reason: &str,
+) -> Result<i64> {
+    log_deny_attempt_for(
+        pool,
+        TYPE_BANK_INTEGRATION,
+        entity_id,
+        attempted_payload,
+        ontology_version,
+        actor,
+        reason,
+    )
+    .await
+}
+
+// ============================================================================
+// F8 — second domain: Customer 360 entity writes.
+//
+// `apply_create_customer_authzed` is the analog of
+// `apply_create_bank_integration_authzed`: same atomic INSERT + log shape,
+// same F5 policy check, different table + projection. The presence of two
+// uniform variants is the whole proof of generalization — daemon dispatch
+// reads `type_name`, picks the right `apply_*`, and the rest is identical.
+// ============================================================================
+
+pub async fn apply_create_customer_authzed(
+    pool: &sqlx::PgPool,
+    cmd: &CreateCustomerCmd,
+    ontology_version: i32,
+    origin: WriteOrigin,
+    actor: &str,
+    policy_card: Option<&ConceptCard>,
+) -> std::result::Result<WriteOutcome, WriteError> {
+    let data = project_customer(
+        &cmd.entity_id,
+        cmd.email.as_deref(),
+        cmd.display_name.as_deref(),
+        cmd.signup_source.as_deref(),
+    );
+
+    // -------- F5 policy check (uniform across concepts) --------
+    if let Some(card) = policy_card {
+        let spec = policy::spec_for_concept(card);
+        let object = policy::object_id("customer", &cmd.entity_id);
+        let decision = policy::evaluate(&spec, actor, RELATION_OWNER, &object);
+        if let PolicyDecision::Deny { reason, considered } = decision {
+            let logged_seq = log_deny_attempt_for(
+                pool,
+                TYPE_CUSTOMER,
+                &cmd.entity_id,
+                &data,
+                ontology_version,
+                actor,
+                &reason,
+            )
+            .await
+            .map_err(WriteError::Other)?;
+            return Err(WriteError::PolicyDenied(PolicyDeniedError {
+                actor: actor.to_string(),
+                relation: RELATION_OWNER.to_string(),
+                object,
+                reason,
+                considered,
+                logged_seq: Some(logged_seq),
+            }));
+        }
+    }
+
+    let mut tx = pool.begin().await.context("begin customer write")?;
+
+    sqlx::query(
+        "INSERT INTO customers (id, email, display_name, signup_source)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET
+            email = EXCLUDED.email,
+            display_name = EXCLUDED.display_name,
+            signup_source = EXCLUDED.signup_source",
+    )
+    .bind(&cmd.entity_id)
+    .bind(&cmd.email)
+    .bind(&cmd.display_name)
+    .bind(&cmd.signup_source)
+    .execute(&mut *tx)
+    .await
+    .context("inserting customer row")?;
+
+    let op = if sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM mutation_log WHERE type_id = $1 AND entity_id = $2",
+    )
+    .bind(TYPE_CUSTOMER)
+    .bind(&cmd.entity_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("counting existing customer mutation_log rows")?
+        > 0
+    {
+        OP_UPDATE
+    } else {
+        OP_CREATE
+    };
+
+    let logged_actor = if actor.is_empty() { origin.actor() } else { actor };
+    let rec = mutation_log::log_mutation_in_tx(
+        &mut tx,
+        TYPE_CUSTOMER,
+        &cmd.entity_id,
+        op,
+        &data,
+        ontology_version,
+        logged_actor,
+    )
+    .await
+    .map_err(WriteError::Other)?;
+
+    tx.commit().await.context("commit customer write")?;
+    Ok(WriteOutcome::from(rec))
 }
 
 #[cfg(test)]

@@ -26,8 +26,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::entity_write::{
-    project_account, project_authentication_method, project_bank_integration,
-    TYPE_ACCOUNT, TYPE_AUTHENTICATION_METHOD, TYPE_BANK_INTEGRATION,
+    project_account, project_authentication_method, project_bank_integration, project_customer,
+    TYPE_ACCOUNT, TYPE_AUTHENTICATION_METHOD, TYPE_BANK_INTEGRATION, TYPE_CUSTOMER,
 };
 use crate::mutation_log::{self, compute_checksum, LoggedMutation};
 
@@ -229,6 +229,32 @@ async fn collect_live_rows(pool: &PgPool) -> Result<Vec<LiveRow>> {
         });
     }
 
+    // F8: Customer 360 — iterate the `customers` table the same way the
+    // other entity tables are iterated. Rows that exist here without a
+    // matching mutation_log entry surface as out-of-band; rows whose
+    // canonical-JSON checksum no longer matches the logged checksum
+    // surface as drift. Same code path as bank_integrations / accounts;
+    // no domain-specific branching in `verify()` itself.
+    let cust: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, email, display_name, signup_source FROM customers ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("reading customers")?;
+    for (id, email, display_name, signup_source) in cust {
+        let data = project_customer(
+            &id,
+            email.as_deref(),
+            display_name.as_deref(),
+            signup_source.as_deref(),
+        );
+        out.push(LiveRow {
+            entity_type: TYPE_CUSTOMER,
+            entity_id: id,
+            data,
+        });
+    }
+
     Ok(out)
 }
 
@@ -251,6 +277,11 @@ async fn latest_per_entity(
         TYPE_BANK_INTEGRATION.to_string(),
         TYPE_AUTHENTICATION_METHOD.to_string(),
         TYPE_ACCOUNT.to_string(),
+        // F8: include Customer 360 entries so writes through the handler
+        // (operation=Create/Update) match against live `customers` rows;
+        // without this, every handler-written Customer would look
+        // out-of-band because we'd never find its log row.
+        TYPE_CUSTOMER.to_string(),
     ][..])
     .fetch_all(pool)
     .await

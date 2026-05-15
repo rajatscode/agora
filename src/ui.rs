@@ -242,9 +242,12 @@ pub async fn home() -> Markup {
         (beat_section(
             "08",
             "Explorer — owner, invariants, lineage, policy, history",
-            "Discovery as a first-class output of the control plane. Every field below is derived from the registry plus the live mutation_log; nothing is hand-painted for the demo.",
+            "Discovery as a first-class output of the control plane. Every field below is derived from the registry plus the live mutation_log; nothing is hand-painted for the demo. Two domains live in the catalog today — Integrations (Beat 7's target) and Customer 360 (the F8 generalization proof).",
             html! {
                 p.hint { "Open a concept to see the explorer view." }
+                h4 style="margin:18px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" {
+                    "Integrations domain"
+                }
                 ul.concept-list {
                     li {
                         a href="/ui/concepts/core.integrations.BankIntegration" {
@@ -264,9 +267,39 @@ pub async fn home() -> Markup {
                             span.team { "owner: identity-platform" }
                         }
                     }
+                }
+                h4 style="margin:18px 0 4px; font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted);" {
+                    "Customer 360 domain (F8 — second domain)"
+                }
+                ul.concept-list {
                     li {
-                        a href="/ui/concepts" { "All concepts →" }
+                        a href="/ui/concepts/core.customer.Customer" {
+                            span.fqn { "core.customer.Customer" }
+                            span.team { "owner: customer-platform" }
+                        }
                     }
+                    li {
+                        a href="/ui/concepts/core.customer.LoyaltyTier" {
+                            span.fqn { "core.customer.LoyaltyTier" }
+                            span.team { "owner: customer-platform" }
+                        }
+                    }
+                    li {
+                        a href="/ui/concepts/core.customer.PurchaseHistory" {
+                            span.fqn { "core.customer.PurchaseHistory" }
+                            span.team { "owner: analytics-platform" }
+                        }
+                    }
+                }
+                p.hint style="margin-top:14px" {
+                    "Same Agora plumbing — risk gate (F2), agent loop (F6), policy enforcement (F5), explorer (this beat) — operates on Customer 360 without a line of domain-specific code. The "
+                    code { "POST /entities/Customer" }
+                    " write path, the "
+                    code { "tighten Customer.email to required" }
+                    " agent prompt, and the explorer view below all work uniformly."
+                }
+                div.row.right style="margin-top:14px" {
+                    a href="/ui/concepts" { "All concepts →" }
                 }
             },
         ))
