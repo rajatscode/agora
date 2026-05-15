@@ -35,6 +35,9 @@ fn map_table(target: &TypeRef) -> Option<&'static str> {
         // proposal lands here just like the Account one — same axis, same
         // SQL, different table. No domain-specific code in this axis.
         "core.customer.Customer" => Some("customers"),
+        // F9: Compliance / GRC third domain. "tighten AuditFinding.resolved_at
+        // to required" lands here too — same axis, same SQL, different table.
+        "core.compliance.AuditFinding" => Some("audit_findings"),
         _ => None,
     }
 }
