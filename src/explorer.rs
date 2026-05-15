@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::ast::{PolicyClass, ProtoType};
-use crate::mutation_log::{self, LoggedMutation};
+use crate::mutation_log::{self, LoggedMutation, ACTOR_CLI, ACTOR_HTTP_HANDLER};
 use crate::seed::{self, ConceptCard};
 
 /// Top-level view returned for `agora explorer <fqn>`. All fields are derived
@@ -187,16 +187,25 @@ fn build_view(
     }
 }
 
-/// Distinct proposal IDs (or actors) that have written into this concept.
-/// We pull from BOTH mutation_log.actor AND generated_artifacts.proposal_id
-/// so an LLM-authored proposal whose first write hasn't happened yet still
-/// appears in lineage.
+/// Distinct proposal IDs (or proposal-like authors) that have written into
+/// this concept. We pull from BOTH mutation_log.actor AND
+/// generated_artifacts.proposal_id so an LLM-authored proposal whose first
+/// write hasn't happened yet still appears in lineage.
+///
+/// System actors (`ACTOR_HTTP_HANDLER`, `ACTOR_CLI`) are excluded — they
+/// describe transport, not authorship, and Beat 8's explorer view should
+/// surface proposals, not the fact that the write happened to come through
+/// the CLI vs the daemon.
 async fn proposals_touching(pool: &PgPool, fqn: &str) -> Result<Vec<String>> {
-    // Mutation actors that look like proposal IDs or agent URIs.
     let actors: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT actor FROM mutation_log WHERE type_id = $1 ORDER BY actor",
+        "SELECT DISTINCT actor
+         FROM mutation_log
+         WHERE type_id = $1
+           AND actor <> ALL($2)
+         ORDER BY actor",
     )
     .bind(fqn)
+    .bind(&[ACTOR_HTTP_HANDLER.to_string(), ACTOR_CLI.to_string()][..])
     .fetch_all(pool)
     .await
     .context("listing distinct mutation actors")?;

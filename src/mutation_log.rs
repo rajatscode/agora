@@ -244,8 +244,8 @@ pub async fn latest_for_entity(
     ))
 }
 
-/// All mutation_log rows for a given type, oldest → newest. Used by the
-/// Explorer to render version history per entity.
+/// All mutation_log rows for a given type, newest → oldest (most recent
+/// mutation first). Used by the Explorer to render version history.
 pub async fn history_for_type(
     pool: &PgPool,
     type_id: &str,

@@ -11,9 +11,7 @@ use crate::ast::OntologyChangeProposal;
 use crate::check;
 use crate::check_report::CheckReport;
 use crate::db;
-use crate::entity_write::{
-    self, CreateBankIntegrationCmd, WriteOrigin, WriteOutcome, TYPE_BANK_INTEGRATION,
-};
+use crate::entity_write::{self, CreateBankIntegrationCmd, WriteOrigin, WriteOutcome};
 use crate::explorer;
 use crate::llm::{self, AuthorMode};
 use crate::reuse::{self, ReuseReport};
@@ -295,11 +293,6 @@ async fn run_explorer(args: ExplorerArgs) -> Result<()> {
     }
 }
 
-// Suppress unused-import warning for TYPE_BANK_INTEGRATION when it isn't
-// referenced directly; the constant is part of the public CLI contract and
-// is re-exported through `entity_write`.
-#[allow(dead_code)]
-const _BI_TYPE: &str = TYPE_BANK_INTEGRATION;
 
 async fn run_check(args: CheckArgs) -> Result<()> {
     eprintln!("[agora] check: loading proposal from {}", args.proposal.display());
